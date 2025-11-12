@@ -1,0 +1,385 @@
+//  Copyright 2024 Institute of Automatic Control RWTH Aachen University
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+//  Author: Kimera VIO Integration Team
+//
+//  KimeraIntegrationInterface: Interface for Kimera VIO to interact with online_fgo_core
+//
+
+#ifndef ONLINE_FGO_CORE_KIMERA_INTEGRATION_INTERFACE_H
+#define ONLINE_FGO_CORE_KIMERA_INTEGRATION_INTERFACE_H
+
+#pragma once
+
+#include <memory>
+#include <vector>
+#include <string>
+#include <optional>
+
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/navigation/NavState.h>
+#include <gtsam/navigation/ImuBias.h>
+#include <gtsam/base/Matrix.h>
+#include <Eigen/Dense>
+
+#include "online_fgo_core/graph/GraphTimeCentricKimera.h"
+#include "online_fgo_core/data/DataTypesFGO.h"
+
+namespace fgo::integration {
+
+  /**
+   * @brief Parameters for Kimera integration
+   */
+  struct KimeraIntegrationParams {
+    // Graph parameters
+    std::string graph_config_path;
+    double smoother_lag = 5.0;  // seconds
+    bool use_isam2 = true;
+    
+    // IMU parameters
+    double imu_rate = 200.0;  // Hz
+    double accel_noise_sigma = 0.01;
+    double gyro_noise_sigma = 0.01;
+    double accel_bias_rw_sigma = 0.0001;
+    double gyro_bias_rw_sigma = 0.0001;
+    Eigen::Vector3d gravity{0.0, 0.0, -9.81};
+    
+    // GP prior parameters
+    bool use_gp_priors = true;
+    std::string gp_type = "WNOJ";  // WNOA, WNOJ, WNOJFull, Singer, SingerFull
+    
+    // Optimization parameters
+    bool optimize_on_keyframe = true;
+    double optimization_period = 0.1;  // seconds
+    
+    KimeraIntegrationParams() = default;
+  };
+
+  /**
+   * @brief Handle to identify a state in the graph
+   * Simple wrapper around state index
+   */
+  struct StateHandle {
+    size_t index = 0;
+    double timestamp = 0.0;
+    bool valid = false;
+    
+    StateHandle() = default;
+    StateHandle(size_t idx, double ts) : index(idx), timestamp(ts), valid(true) {}
+    
+    explicit operator bool() const { return valid; }
+  };
+
+  /**
+   * @brief Result of an optimization operation
+   */
+  struct OptimizationResult {
+    bool success = false;
+    double optimization_time_ms = 0.0;
+    size_t num_states = 0;
+    size_t num_factors = 0;
+    std::string error_message;
+    
+    // Latest optimized state
+    gtsam::NavState latest_nav_state;
+    gtsam::imuBias::ConstantBias latest_bias;
+    gtsam::Matrix latest_covariance;
+    
+    OptimizationResult() = default;
+  };
+
+  /**
+   * @brief Factor data for external factor insertion (future use)
+   */
+  struct FactorData {
+    std::string factor_type;
+    std::vector<StateHandle> connected_states;
+    // Additional factor-specific data would go here
+    
+    FactorData() = default;
+  };
+
+  /**
+   * @brief Interface class that Kimera adapter uses to interact with online_fgo_core
+   * 
+   * This interface provides a clean abstraction layer between Kimera VIO and
+   * online_fgo_core's GraphTimeCentricKimera. The Kimera adapter (in Kimera-VIO package)
+   * uses this interface to:
+   * - Create states at arbitrary timestamps
+   * - Add IMU measurements
+   * - Trigger optimization
+   * - Retrieve results
+   * 
+   * Design pattern: Facade pattern - hides complexity of GraphTimeCentricKimera
+   * Thread safety: Not thread-safe, caller must synchronize if needed
+   */
+  class KimeraIntegrationInterface {
+  public:
+    /**
+     * @brief Constructor
+     * @param app Application interface for framework-agnostic services
+     */
+    explicit KimeraIntegrationInterface(fgo::core::ApplicationInterface& app);
+
+    /**
+     * @brief Destructor
+     */
+    virtual ~KimeraIntegrationInterface() = default;
+
+    /**
+     * @brief Initialize the integration interface with parameters
+     * @param params Kimera integration parameters
+     * @return true if initialization successful
+     * 
+     * TODO: Create GraphTimeCentricKimera instance
+     * TODO: Load parameters and configure graph
+     * TODO: Initialize IMU preintegration parameters
+     */
+    bool initialize(const KimeraIntegrationParams& params);
+
+    /**
+     * @brief Check if interface is initialized and ready
+     * @return true if ready to use
+     */
+    bool isInitialized() const { return initialized_; }
+
+    // ========================================================================
+    // STATE MANAGEMENT
+    // ========================================================================
+
+    /**
+     * @brief Create a new state at the specified timestamp
+     * 
+     * This will call findOrCreateStateForTimestamp on the underlying graph.
+     * If a state already exists at this timestamp (within tolerance), returns
+     * handle to existing state.
+     * 
+     * @param timestamp Timestamp in seconds
+     * @return StateHandle for the created/existing state
+     * 
+     * TODO: Call graph_->findOrCreateStateForTimestamp()
+     * TODO: Create StateHandle from result
+     */
+    StateHandle createStateAtTimestamp(double timestamp);
+
+    /**
+     * @brief Get existing state at timestamp
+     * @param timestamp Timestamp in seconds
+     * @return StateHandle if state exists, invalid handle otherwise
+     * 
+     * TODO: Call graph_->hasStateAtTimestamp() and graph_->getStateIndexAtTimestamp()
+     */
+    StateHandle getStateAtTimestamp(double timestamp);
+
+    /**
+     * @brief Get all state timestamps currently in the graph
+     * @return Vector of timestamps in seconds
+     * 
+     * TODO: Call graph_->getAllStateTimestamps()
+     */
+    std::vector<double> getAllStateTimestamps();
+
+    // ========================================================================
+    // IMU DATA HANDLING
+    // ========================================================================
+
+    /**
+     * @brief Add a single IMU measurement
+     * @param timestamp Timestamp in seconds
+     * @param accel Linear acceleration in m/s^2
+     * @param gyro Angular velocity in rad/s
+     * @param dt Time delta from previous measurement
+     * @return true if successfully added
+     * 
+     * TODO: Convert to fgo::data::IMUMeasurement
+     * TODO: Add to graph via graph_->addIMUMeasurements()
+     */
+    bool addIMUData(double timestamp, 
+                    const Eigen::Vector3d& accel, 
+                    const Eigen::Vector3d& gyro, 
+                    double dt);
+
+    /**
+     * @brief Add multiple IMU measurements in batch
+     * @param timestamps Vector of timestamps in seconds
+     * @param accels Vector of accelerations
+     * @param gyros Vector of gyros
+     * @param dts Vector of time deltas
+     * @return Number of measurements successfully added
+     * 
+     * TODO: Convert to vector of fgo::data::IMUMeasurement
+     * TODO: Add to graph in batch
+     */
+    size_t addIMUDataBatch(const std::vector<double>& timestamps,
+                           const std::vector<Eigen::Vector3d>& accels,
+                           const std::vector<Eigen::Vector3d>& gyros,
+                           const std::vector<double>& dts);
+
+    // ========================================================================
+    // FACTOR INSERTION (Future use for visual factors)
+    // ========================================================================
+
+    /**
+     * @brief Add an external factor to the graph
+     * @param factor_data Data describing the factor
+     * @return true if successfully added
+     * 
+     * NOTE: This is a placeholder for future smart factor integration
+     * TODO: Implement when adding visual factors
+     */
+    bool addFactor(const FactorData& factor_data);
+
+    // ========================================================================
+    // OPTIMIZATION
+    // ========================================================================
+
+    /**
+     * @brief Trigger graph optimization
+     * 
+     * This will:
+     * 1. Construct factor graph from buffered states/measurements
+     * 2. Run ISAM2/batch optimization
+     * 3. Extract results
+     * 
+     * @return OptimizationResult with success status and optimized state
+     * 
+     * TODO: Call graph_->constructFactorGraphFromTimestamps() with buffered timestamps
+     * TODO: Call graph_->optimizeWithExternalFactors()
+     * TODO: Package results into OptimizationResult
+     */
+    OptimizationResult optimize();
+
+    /**
+     * @brief Optimize and return only the latest state
+     * Convenience method for common use case
+     * @param nav_state Output: latest NavState
+     * @param bias Output: latest IMU bias
+     * @return true if optimization successful
+     * 
+     * TODO: Call optimize() and extract latest state
+     */
+    bool optimizeAndGetLatestState(gtsam::NavState& nav_state, 
+                                    gtsam::imuBias::ConstantBias& bias);
+
+    // ========================================================================
+    // RESULT RETRIEVAL
+    // ========================================================================
+
+    /**
+     * @brief Get optimized state at specific state handle
+     * @param handle State handle
+     * @return NavState if available
+     * 
+     * TODO: Call graph_->getOptimizedPose() and graph_->getOptimizedVelocity()
+     * TODO: Combine into NavState
+     */
+    std::optional<gtsam::NavState> getOptimizedState(StateHandle handle);
+
+    /**
+     * @brief Get optimized IMU bias at state handle
+     * @param handle State handle
+     * @return IMU bias if available
+     * 
+     * TODO: Call graph_->getOptimizedBias()
+     */
+    std::optional<gtsam::imuBias::ConstantBias> getOptimizedBias(StateHandle handle);
+
+    /**
+     * @brief Get state covariance at state handle
+     * @param handle State handle
+     * @return Covariance matrix if available
+     * 
+     * TODO: Call graph_->getStateCovariance()
+     */
+    std::optional<gtsam::Matrix> getStateCovariance(StateHandle handle);
+
+    /**
+     * @brief Get latest optimized NavState
+     * @return NavState at most recent state
+     * 
+     * TODO: Get latest state index from graph and retrieve state
+     */
+    std::optional<gtsam::NavState> getLatestOptimizedState();
+
+    /**
+     * @brief Get latest optimized IMU bias
+     * @return Bias at most recent state
+     * 
+     * TODO: Get latest state index and retrieve bias
+     */
+    std::optional<gtsam::imuBias::ConstantBias> getLatestOptimizedBias();
+
+    // ========================================================================
+    // CONFIGURATION
+    // ========================================================================
+
+    /**
+     * @brief Update integration parameters at runtime
+     * @param params New parameters
+     * 
+     * TODO: Update graph_->setKimeraParams() with relevant params
+     */
+    void updateParameters(const KimeraIntegrationParams& params);
+
+    /**
+     * @brief Get current parameters
+     * @return Current integration parameters
+     */
+    const KimeraIntegrationParams& getParameters() const { return params_; }
+
+    /**
+     * @brief Get pointer to underlying graph (for advanced use)
+     * @return Pointer to GraphTimeCentricKimera
+     * 
+     * NOTE: Use with caution, prefer using interface methods
+     */
+    std::shared_ptr<fgo::graph::GraphTimeCentricKimera> getGraph() { return graph_; }
+
+  protected:
+    // Application interface
+    fgo::core::ApplicationInterface* app_;
+    
+    // Underlying graph
+    std::shared_ptr<fgo::graph::GraphTimeCentricKimera> graph_;
+    
+    // Parameters
+    KimeraIntegrationParams params_;
+    
+    // Initialization flag
+    bool initialized_ = false;
+    
+    // Buffered state timestamps (for batched optimization)
+    std::vector<double> bufferedStateTimestamps_;
+    
+    /**
+     * @brief Helper: Convert Eigen vectors to fgo::data::IMUMeasurement
+     * @param timestamp Timestamp
+     * @param accel Acceleration
+     * @param gyro Gyro
+     * @param dt Time delta
+     * @return IMUMeasurement
+     * 
+     * TODO: Populate all fields of IMUMeasurement struct
+     * TODO: Set covariances from params
+     */
+    fgo::data::IMUMeasurement convertToIMUMeasurement(
+        double timestamp,
+        const Eigen::Vector3d& accel,
+        const Eigen::Vector3d& gyro,
+        double dt);
+  };
+
+} // namespace fgo::integration
+
+#endif // ONLINE_FGO_CORE_KIMERA_INTEGRATION_INTERFACE_H

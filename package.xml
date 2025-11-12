@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>online_fgo_core</name>
+  <version>0.1.0</version>
+  <description>Online Factor Graph Optimization Core Library</description>
+
+  <maintainer email="jkalinovskiy@gmail.com">Your Name</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+
+  <export>
+    <!-- Specify that this is not a catkin package, just plain CMake -->
+    <build_type>cmake</build_type>
+  </export>
+</package>
