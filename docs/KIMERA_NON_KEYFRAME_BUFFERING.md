@@ -4,7 +4,7 @@
 This document describes the implementation of a buffering system for non-keyframe states in the Kimera VIO integration with GraphTimeCentricKimera. Instead of discarding non-keyframe states, they are now buffered and added to the factor graph in chronological order when the next keyframe arrives.
 
 ## Problem Statement
-Previously, Kimera VIO's backend runs a keyframe filter (`shouldBeKeyframe`) and discards states that don't meet the keyframe criteria. This results in:
+Previously, Kimera VIO's frontend runs a keyframe filter (`shouldBeKeyframe`) and the pipeline only forwarded keyframes to the backend, discarding non-keyframes. This results in:
 - Loss of temporal information between keyframes
 - Suboptimal trajectory estimation
 - Missed opportunities for constraint incorporation
@@ -13,43 +13,155 @@ Previously, Kimera VIO's backend runs a keyframe filter (`shouldBeKeyframe`) and
 
 ### High-Level Design
 ```
-VioBackend State Filter Decision
+Frontend Keyframe Decision → Pipeline → Backend
     ├─> IS KEYFRAME
-    │   ├─> Process all buffered non-keyframes (chronologically)
-    │   ├─> Add keyframe state
+    │   ├─> MonoFrontendOutput(is_keyframe_=true, ...)
+    │   ├─> Pipeline converts to BackendInput(is_keyframe_=true, ...)
+    │   ├─> Backend processes all buffered non-keyframes (chronologically)
+    │   ├─> Backend adds keyframe state
     │   └─> Clear buffer
     │
     └─> NOT KEYFRAME
-        └─> Buffer state for later addition
+        ├─> MonoFrontendOutput(is_keyframe_=false, ...)
+        ├─> Pipeline converts to BackendInput(is_keyframe_=false, ...)
+        └─> Backend buffers state for later addition
 ```
 
-### Data Flow
+### Complete Data Flow
 ```
-Frame Processing Loop:
-  1. VioBackend processes frame (pose, velocity, bias estimate)
-  2. Keyframe filter decides: keyframe or not?
-  
-  If NOT keyframe:
-    → Call: adapter->bufferNonKeyframeState(timestamp, pose, vel, bias)
-    → Store in non_keyframe_buffer_
-    → Continue to next frame
-  
-  If IS keyframe:
-    → Call: adapter->addKeyframeState(timestamp, pose, vel, bias)
-    → Process steps:
-      a) Sort buffered states by timestamp
-      b) For each buffered state (chronologically):
-         - Convert to seconds
-         - Create state via interface->createStateAtTimestamp()
-         - Track in state_timestamps_ vector
-      c) Add the keyframe state
-      d) Clear buffer
-    → Result: All states added in chronological order
+1. FRONTEND (MonoVisionImuFrontend::nominalSpinMono)
+   - Preintegrate IMU: pim = imu_frontend_->preintegrateImuMeasurements()
+   - Track features and determine keyframe: mono_frame_km1_->isKeyframe_
+   - Return MonoFrontendOutput with is_keyframe_ flag set
+
+2. PIPELINE (MonoImuPipeline)
+   - Receive MonoFrontendOutput from frontend
+   - Convert to BackendInput, passing is_keyframe_ flag
+   - Push ALL frames (keyframes + non-keyframes) to backend queue
+
+3. BACKEND (VioBackend::addVisualInertialStateAndOptimize)
+   - Check input.is_keyframe_ flag
+   - Extract NavState from PIM: navstate_k = pim->predict(navstate_lkf, bias)
+   - Forward IMU measurements to adapter
+   
+   If NOT keyframe:
+     → adapter->bufferNonKeyframeState(timestamp, pose, vel, bias)
+     → Store in non_keyframe_buffer_
+     → Return success (no optimization)
+   
+   If IS keyframe:
+     → adapter->addKeyframeState(timestamp, pose, vel, bias)
+     → Process steps:
+       a) Sort buffered states by timestamp
+       b) For each buffered state (chronologically):
+          - Convert to seconds
+          - Create state via interface->createStateAtTimestamp()
+          - Track in state_timestamps_ vector
+       c) Add the keyframe state
+       d) Clear buffer
+       e) Trigger optimization
+     → Result: All states added in chronological order
+
+4. IMU DATA FORWARDING
+   - Backend extracts IMU from input.imu_acc_gyrs_
+   - For each IMU measurement:
+     → adapter->addIMUMeasurement(timestamp, accel, gyro)
+     → Adapter computes dt from previous timestamp
+     → interface->addIMUData(timestamp_sec, accel, gyro, dt)
+     → Interface converts to fgo::data::IMUMeasurement
+     → graph->addIMUMeasurements(imu_vec)
 ```
 
 ## Implementation Details
 
-### 1. GraphTimeCentricBackendAdapter Header Changes
+### 1. BackendInput Structure Changes (`VioBackend-definitions.h`)
+
+#### Added is_keyframe_ Flag
+```cpp
+struct BackendInput : public PipelinePayload {
+  // ... existing members ...
+  bool is_keyframe_;  // Flag to distinguish keyframes from non-keyframes
+  
+  BackendInput(..., bool is_keyframe = true)  // Default true for backward compatibility
+      : ..., is_keyframe_(is_keyframe) {}
+};
+```
+
+**Purpose**: Allows backend to distinguish keyframes from non-keyframes
+**Default**: `true` for backward compatibility with existing code
+
+### 2. MonoImuPipeline Changes (`MonoImuPipeline.cpp`)
+
+#### Updated Output Callback
+```cpp
+vio_frontend_module_->registerOutputCallback(
+    [&backend_input_queue](const FrontendOutputPacketBase::Ptr& output) {
+      auto converted_output = std::dynamic_pointer_cast<MonoFrontendOutput>(output);
+      CHECK(converted_output);
+      
+      // Push ALL frames to backend (keyframes and non-keyframes)
+      // Backend will handle buffering based on is_keyframe_ flag
+      backend_input_queue.push(std::make_unique<BackendInput>(
+          converted_output->frame_lkf_.timestamp_,
+          converted_output->status_mono_measurements_,
+          converted_output->pim_,
+          converted_output->imu_acc_gyrs_,
+          converted_output->body_lkf_OdomPose_body_kf_,
+          converted_output->body_kf_world_OdomVel_body_kf_,
+          converted_output->is_keyframe_));  // Pass keyframe flag
+    });
+```
+
+**Key Change**: Removed `if (converted_output->is_keyframe_)` check - now pushes ALL frames
+**Benefit**: Backend receives all frames and can decide how to process them
+
+### 3. VioBackend Logic Changes (`VioBackend.cpp`)
+
+#### Updated addVisualInertialStateAndOptimize
+```cpp
+bool VioBackend::addVisualInertialStateAndOptimize(const BackendInput& input) {
+  CHECK(input.pim_);
+  
+#ifdef ENABLE_GRAPH_TIME_CENTRIC_ADAPTER
+  if (backend_params_.use_graph_time_centric && graph_time_centric_adapter_) {
+    // Extract state from preintegration
+    gtsam::NavState navstate_k = input.pim_->predict(navstate_lkf, imu_bias_lkf_);
+    
+    // Forward IMU measurements
+    for (const auto& imu_meas : input.imu_acc_gyrs_) {
+      graph_time_centric_adapter_->addIMUMeasurement(
+          imu_meas.timestamp_, imu_meas.imu_acc_, imu_meas.imu_gyr_);
+    }
+    
+    if (input.is_keyframe_) {
+      // Process keyframe + buffered non-keyframes
+      graph_time_centric_adapter_->addKeyframeState(...);
+      bool success = graph_time_centric_adapter_->optimizeGraph();
+      // Update backend state from optimized values
+      return success;
+    } else {
+      // Buffer non-keyframe
+      graph_time_centric_adapter_->bufferNonKeyframeState(...);
+      return true;  // No optimization for non-keyframes
+    }
+  }
+#endif
+  
+  // Standard mode: skip non-keyframes (backward compatible)
+  if (!input.is_keyframe_) {
+    return true;
+  }
+  CHECK(input.status_stereo_measurements_kf_);
+  // ... existing backend logic ...
+}
+```
+
+**Key Changes**:
+- Forward ALL IMU measurements to adapter
+- Check `input.is_keyframe_` to decide buffer vs process
+- Standard mode maintains original behavior (only processes keyframes)
+
+### 4. GraphTimeCentricBackendAdapter Header Changes
 
 #### New Buffer Structure
 ```cpp
@@ -97,6 +209,20 @@ bool bufferNonKeyframeState(
     const gtsam::Vector3& velocity,
     const gtsam::imuBias::ConstantBias& bias);
 ```
+
+#### IMU Measurement Tracking
+```cpp
+// Member variable for dt computation
+double last_imu_timestamp_sec_ = 0.0;
+
+// Method signature
+void addIMUMeasurement(
+    const Timestamp& timestamp,
+    const gtsam::Vector3& linear_acceleration,
+    const gtsam::Vector3& angular_velocity);
+```
+
+**Implementation**: Computes dt from previous timestamp for GP priors
 
 ### 2. GraphTimeCentricBackendAdapter Implementation Changes
 
@@ -456,4 +582,59 @@ if (shouldBeKeyframe(frame)) {
 
 // Monitor buffer
 LOG(INFO) << "Buffered states: " << adapter_->getNumBufferedStates();
+```
+
+## Build Instructions
+
+### Enable GraphTimeCentric Adapter
+
+To build Kimera VIO with the GraphTimeCentric adapter integration:
+
+```bash
+cd /workspaces/src
+catkin build kimera_vio --cmake-args -DENABLE_GRAPH_TIME_CENTRIC_ADAPTER=ON
+```
+
+### Full Rebuild (if needed)
+
+If you encounter issues, do a clean rebuild:
+
+```bash
+cd /workspaces/src
+catkin clean kimera_vio
+catkin build kimera_vio --cmake-args -DENABLE_GRAPH_TIME_CENTRIC_ADAPTER=ON
+```
+
+### Build with ROS Integration
+
+To build the complete ROS package:
+
+```bash
+cd /workspaces/src
+catkin build kimera_vio_ros --cmake-args -DENABLE_GRAPH_TIME_CENTRIC_ADAPTER=ON
+```
+
+### Verify Build
+
+Check that the adapter is enabled:
+
+```bash
+grep -r "ENABLE_GRAPH_TIME_CENTRIC_ADAPTER" build/kimera_vio/
+```
+
+You should see the flag defined in the build configuration.
+
+### Runtime Configuration
+
+Enable GraphTimeCentric backend in your launch file or config:
+
+```yaml
+# In backend_params.yaml
+use_graph_time_centric: true
+```
+
+Or via launch file parameter:
+
+```xml
+<param name="backend_params/use_graph_time_centric" value="true" />
 ```
