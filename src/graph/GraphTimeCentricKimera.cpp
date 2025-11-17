@@ -37,6 +37,7 @@ GraphTimeCentricKimera::GraphTimeCentricKimera(fgo::core::ApplicationInterface& 
 
 bool GraphTimeCentricKimera::initializeKimeraSupport() {
   appPtr_->getLogger().info("GraphTimeCentricKimera: initializing Kimera support...");
+  std::cout << "[online_fgo_core] GraphTimeCentricKimera: INITIALIZING KIMERA SUPPORT" << std::endl;
   
   try {
     // Load Kimera-specific parameters from application interface
@@ -96,6 +97,7 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
 // ========================================================================
 
 size_t GraphTimeCentricKimera::findOrCreateStateForTimestamp(double timestamp, bool create_if_missing) {
+  std::cout << "[online_fgo_core] GraphTimeCentricKimera: FIND OR CREATE STATE FOR TIMESTAMP " << timestamp << std::endl;
   // 1. Search for existing state within tolerance
   size_t existing_state = findNearestState(timestamp, kimeraParams_.timestampMatchTolerance);
   
@@ -172,6 +174,8 @@ bool GraphTimeCentricKimera::addIMUMeasurements(
     return false;
   }
   
+  std::cout << "[online_fgo_core] GraphTimeCentricKimera: ADDING " << imu_measurements.size() << " IMU MEASUREMENTS" << std::endl;
+  
   appPtr_->getLogger().debug("GraphTimeCentricKimera: Adding " + 
                              std::to_string(imu_measurements.size()) + " IMU measurements");
   
@@ -196,6 +200,8 @@ StatusGraphConstruction GraphTimeCentricKimera::constructFactorGraphFromTimestam
     appPtr_->getLogger().error("GraphTimeCentricKimera: No timestamps provided for graph construction");
     return StatusGraphConstruction::FAILED;
   }
+  
+  std::cout << "[online_fgo_core] GraphTimeCentricKimera: CONSTRUCT FACTOR GRAPH FROM " << timestamps.size() << " TIMESTAMPS" << std::endl;
   
   appPtr_->getLogger().info("GraphTimeCentricKimera: Constructing factor graph from " + 
                             std::to_string(timestamps.size()) + " timestamps");
@@ -462,6 +468,7 @@ bool GraphTimeCentricKimera::addExternalFactor(
 
 double GraphTimeCentricKimera::optimizeWithExternalFactors(fgo::data::State& new_state) {
   appPtr_->getLogger().info("GraphTimeCentricKimera: Starting optimization with external factors...");
+  std::cout << "[online_fgo_core] GraphTimeCentricKimera: OPTIMIZE WITH EXTERNAL FACTORS" << std::endl;
   
   // Call base class optimize method
   double opt_time = this->optimize(new_state);

@@ -29,6 +29,7 @@ KimeraIntegrationInterface::KimeraIntegrationInterface(fgo::core::ApplicationInt
 
 bool KimeraIntegrationInterface::initialize(const KimeraIntegrationParams& params) {
   app_->getLogger().info("KimeraIntegrationInterface: initializing...");
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: INITIALIZING" << std::endl;
   
   params_ = params;
   
@@ -79,6 +80,8 @@ StateHandle KimeraIntegrationInterface::createStateAtTimestamp(double timestamp)
     app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
     return StateHandle();
   }
+  
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: CREATE STATE AT TIMESTAMP " << timestamp << std::endl;
   
   try {
     size_t state_idx = graph_->findOrCreateStateForTimestamp(timestamp, true);
@@ -148,6 +151,8 @@ bool KimeraIntegrationInterface::addIMUData(double timestamp,
     return false;
   }
   
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD IMU DATA AT TIMESTAMP " << timestamp << std::endl;
+  
   try {
     // Convert to fgo::data::IMUMeasurement
     fgo::data::IMUMeasurement imu_meas = convertToIMUMeasurement(timestamp, accel, gyro, dt);
@@ -170,6 +175,10 @@ size_t KimeraIntegrationInterface::addIMUDataBatch(const std::vector<double>& ti
   if (!initialized_) {
     app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
     return 0;
+  }
+  
+  if (!timestamps.empty()) {
+    std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD IMU DATA BATCH, " << timestamps.size() << " measurements, from " << timestamps.front() << " to " << timestamps.back() << std::endl;
   }
   
   if (timestamps.size() != accels.size() || 
@@ -226,6 +235,8 @@ OptimizationResult KimeraIntegrationInterface::optimize() {
     result.error_message = "Not initialized";
     return result;
   }
+  
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: OPTIMIZE" << std::endl;
   
   OptimizationResult result;
   

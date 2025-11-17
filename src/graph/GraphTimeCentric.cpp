@@ -36,6 +36,8 @@ namespace fgo::graph {
   StatusGraphConstruction GraphTimeCentric::constructFactorGraphOnIMU(
       std::vector<fgo::data::IMUMeasurement>& dataIMU) {
 
+    std::cout << "[online_fgo_core] GraphTimeCentric: CONSTRUCT FACTOR GRAPH ON IMU" << std::endl;
+
     static boost::circular_buffer<std::pair<double, gtsam::Vector3>> timeGyroMap(
         20 * graphBaseParamPtr_->IMUMeasurementFrequency / graphBaseParamPtr_->optFrequency);
     static boost::circular_buffer<std::pair<size_t, gtsam::Vector6>> stateIDAccMap(
@@ -272,6 +274,8 @@ namespace fgo::graph {
   StatusGraphConstruction GraphTimeCentric::constructFactorGraphOnTime(
       const std::vector<double> &stateTimestamps,
       std::vector<fgo::data::IMUMeasurement> &dataIMU) {
+
+    std::cout << "[online_fgo_core] GraphTimeCentric: CONSTRUCT FACTOR GRAPH ON TIME" << std::endl;
 
     static const double betweenOptimizationTime = 1. / paramPtr_->optFrequency;
     static boost::circular_buffer<std::pair<double, gtsam::Vector3>> timeGyroMap(
@@ -517,6 +521,7 @@ namespace fgo::graph {
   }
 
   double GraphTimeCentric::optimize(data::State &new_state) {
+    std::cout << "[online_fgo_core] GraphTimeCentric: OPTIMIZE" << std::endl;
     std::chrono::time_point<std::chrono::system_clock> start = std::chrono::system_clock::now();
 
     solver_->update(*this, values_, keyTimestampMap_, gtsam::FactorIndices(), relatedKeys_);
