@@ -43,4 +43,12 @@ ApplicationInterface::createPublisherImpl<fgo::graph::SensorProcessingReport>(co
   return std::make_shared<NullPublisher<fgo::graph::SensorProcessingReport>>();
 }
 
+template<>
+std::shared_ptr<PublisherInterface<fgo::integrator::SensorProcessingReport>> 
+ApplicationInterface::createPublisherImpl<fgo::integrator::SensorProcessingReport>(const std::string& /*topic*/) {
+  // Default implementation: return a null publisher
+  // Derived classes can override createPublisher() to provide actual functionality
+  return std::make_shared<NullPublisher<fgo::integrator::SensorProcessingReport>>();
+}
+
 } // namespace fgo::core

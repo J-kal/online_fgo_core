@@ -44,40 +44,20 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
     auto& params = appPtr_->getParameters();
     
     // State creation parameters
-    if (params.hasParameter("kimera.timestamp_match_tolerance")) {
-      kimeraParams_.timestampMatchTolerance = params.getParameter<double>("kimera.timestamp_match_tolerance");
-    }
-    
-    if (params.hasParameter("kimera.create_states_at_imu_rate")) {
-      kimeraParams_.createStatesAtIMURate = params.getParameter<bool>("kimera.create_states_at_imu_rate");
-    }
-    
-    if (params.hasParameter("kimera.imu_state_frequency")) {
-      kimeraParams_.imuStateFrequency = params.getParameter<double>("kimera.imu_state_frequency");
-    }
+    kimeraParams_.timestampMatchTolerance = params.getDouble("kimera.timestamp_match_tolerance", 0.001);
+    kimeraParams_.createStatesAtIMURate = params.getBool("kimera.create_states_at_imu_rate", true);
+    kimeraParams_.imuStateFrequency = params.getDouble("kimera.imu_state_frequency", 200.0);
     
     // IMU factor configuration
-    if (params.hasParameter("kimera.use_combined_imu_factor")) {
-      kimeraParams_.useCombinedIMUFactor = params.getParameter<bool>("kimera.use_combined_imu_factor");
-    }
+    kimeraParams_.useCombinedIMUFactor = params.getBool("kimera.use_combined_imu_factor", true);
     
     // GP prior configuration
-    if (params.hasParameter("kimera.add_gp_motion_priors")) {
-      kimeraParams_.addGPMotionPriors = params.getParameter<bool>("kimera.add_gp_motion_priors");
-    }
+    kimeraParams_.addGPMotionPriors = params.getBool("kimera.add_gp_motion_priors", true);
     
     // Smart factor configuration (future)
-    if (params.hasParameter("kimera.enable_smart_factors")) {
-      kimeraParams_.enableSmartFactors = params.getParameter<bool>("kimera.enable_smart_factors");
-    }
-    
-    if (params.hasParameter("kimera.cheirality_threshold")) {
-      kimeraParams_.cheiralityThreshold = params.getParameter<double>("kimera.cheirality_threshold");
-    }
-    
-    if (params.hasParameter("kimera.min_observations")) {
-      kimeraParams_.minObservations = params.getParameter<size_t>("kimera.min_observations");
-    }
+    kimeraParams_.enableSmartFactors = params.getBool("kimera.enable_smart_factors", false);
+    kimeraParams_.cheiralityThreshold = params.getDouble("kimera.cheirality_threshold", 0.1);
+    kimeraParams_.minObservations = params.getInt("kimera.min_observations", 2);
     
     appPtr_->getLogger().info("GraphTimeCentricKimera: Kimera support initialized successfully");
     appPtr_->getLogger().info("  - Timestamp tolerance: " + std::to_string(kimeraParams_.timestampMatchTolerance) + " s");
@@ -387,20 +367,18 @@ bool GraphTimeCentricKimera::addGPMotionPriorBetweenStates(size_t state_i_idx, s
     gtsam::Vector6 acc_i_val = gtsam::Vector6::Zero();
     gtsam::Vector6 acc_j_val = gtsam::Vector6::Zero();
     
-    if (paramPtr_->gpType == fgo::data::GPModelType::WNOJ || 
-        paramPtr_->gpType == fgo::data::GPModelType::WNOJFull ||
-        paramPtr_->gpType == fgo::data::GPModelType::Singer ||
-        paramPtr_->gpType == fgo::data::GPModelType::SingerFull) {
+    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJ || 
+        graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJFull ||
+        graphBaseParamPtr_->gpType == fgo::data::GPModelType::Singer ||
+        graphBaseParamPtr_->gpType == fgo::data::GPModelType::SingerFull) {
       
       // Try to get from accBuffer or use zero
-      auto acc_buf = accBuffer_.get_buffer_from_id(state_i_idx);
-      if (acc_buf.size() > 0) {
-        acc_i_val = acc_buf.back();
+      if (accBuffer_.size() > state_i_idx) {
+        acc_i_val = accBuffer_.get_buffer_from_id(state_i_idx);
       }
       
-      acc_buf = accBuffer_.get_buffer_from_id(state_j_idx);
-      if (acc_buf.size() > 0) {
-        acc_j_val = acc_buf.back();
+      if (accBuffer_.size() > state_j_idx) {
+        acc_j_val = accBuffer_.get_buffer_from_id(state_j_idx);
       }
     }
     
@@ -663,22 +641,21 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
     currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
     
     // If GP factors enabled, also insert omega and acc keys
-    if (paramPtr_->addGPPriorFactor || paramPtr_->addGPInterpolatedFactor) {
+    if (graphBaseParamPtr_->addGPPriorFactor || graphBaseParamPtr_->addGPInterpolatedFactor) {
       gtsam::Key omega_key = W(state_idx);
       values_.insert(omega_key, predicted_state.omega);
       keyTimestampMap_[omega_key] = timestamp;
     }
     
-    if (paramPtr_->gpType == fgo::data::GPModelType::WNOJFull || 
-        paramPtr_->gpType == fgo::data::GPModelType::SingerFull ||
-        paramPtr_->addConstantAccelerationFactor) {
+    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJFull || 
+        graphBaseParamPtr_->gpType == fgo::data::GPModelType::SingerFull ||
+        graphBaseParamPtr_->addConstantAccelerationFactor) {
       gtsam::Key acc_key = A(state_idx);
       
       // Get acceleration from buffer if available, otherwise use zero
       gtsam::Vector6 acc = gtsam::Vector6::Zero();
-      auto acc_buf = accBuffer_.get_buffer_from_id(state_idx - 1);
-      if (!acc_buf.empty()) {
-        acc = acc_buf.back();
+      if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
+        acc = accBuffer_.get_buffer_from_id(state_idx - 1);
       }
       
       values_.insert(acc_key, acc);
