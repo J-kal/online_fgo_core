@@ -159,6 +159,7 @@ target_link_libraries(online_fgo_utils
 add_library(online_fgo_graph
     src/graph/GraphBase.cpp
     src/graph/GraphTimeCentric.cpp
+    src/graph/GraphTimeCentricKimera.cpp
 )
 
 target_include_directories(online_fgo_graph
@@ -186,6 +187,7 @@ target_link_libraries(online_fgo_graph
 # Integrator library (with implementations)
 add_library(online_fgo_integrator
     src/integrator/IntegratorBase.cpp
+    src/integration/KimeraIntegrationInterface.cpp
 )
 
 target_include_directories(online_fgo_integrator
