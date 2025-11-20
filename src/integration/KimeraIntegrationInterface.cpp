@@ -19,8 +19,106 @@
 
 #include "online_fgo_core/integration/KimeraIntegrationInterface.h"
 #include "online_fgo_core/data/DataTypesFGO.h"
+#include <fstream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace fgo::integration {
+
+// Helper function to save factor graph debug information
+static void saveFactorGraphDebugInfo(
+    const gtsam::NonlinearFactorGraph& graph,
+    const gtsam::Values& values,
+    const std::string& error_type,
+    fgo::core::LoggerInterface& logger) {
+  
+  try {
+    // Create debug_run_logs directory if it doesn't exist
+    const std::string debug_dir = "debug_run_logs";
+    mkdir(debug_dir.c_str(), 0755);
+    
+    // Generate timestamp for filenames
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_now = *std::localtime(&time_t_now);
+    
+    std::ostringstream timestamp_ss;
+    timestamp_ss << std::put_time(&tm_now, "%Y%m%d_%H%M%S");
+    std::string timestamp = timestamp_ss.str();
+    
+    std::string prefix = debug_dir + "/" + error_type + "_" + timestamp;
+    
+    // 1. Print factor keys to logger (easier to read than full graph)
+    logger.error("=== Factor Graph Debug Info (" + error_type + ") ===");
+    logger.error("Total factors: " + std::to_string(graph.size()));
+    logger.error("Total values: " + std::to_string(values.size()));
+    
+    logger.error("\n--- Factor Keys ---");
+    for (size_t i = 0; i < graph.size(); ++i) {
+      if (graph[i]) {
+        std::ostringstream keys_ss;
+        keys_ss << "Factor " << i << ": ";
+        for (const auto& key : graph[i]->keys()) {
+          keys_ss << gtsam::DefaultKeyFormatter(key) << " ";
+        }
+        logger.error(keys_ss.str());
+      }
+    }
+    
+    logger.error("\n--- Value Keys ---");
+    std::ostringstream values_ss;
+    for (const auto& key_value : values) {
+      values_ss << gtsam::DefaultKeyFormatter(key_value.key) << " ";
+    }
+    logger.error(values_ss.str());
+    
+    // 2. Save .g2o file (standard factor graph format)
+    std::string g2o_filename = prefix + ".g2o";
+    logger.error("Saving .g2o file to: " + g2o_filename);
+    graph.saveGraph(g2o_filename, values);
+    
+    // 3. Save .dot file (GraphViz visualization format)
+    std::string dot_filename = prefix + ".dot";
+    logger.error("Saving .dot file to: " + dot_filename);
+    std::ofstream dot_file(dot_filename);
+    if (dot_file.is_open()) {
+      // Use the print method with a custom formatter
+      dot_file << "digraph G {" << std::endl;
+      dot_file << "  // Factor Graph Visualization" << std::endl;
+      dot_file << "  // Total factors: " << graph.size() << std::endl;
+      dot_file << "  // Total values: " << values.size() << std::endl;
+      
+      // Add nodes for values
+      for (const auto& key_value : values) {
+        dot_file << "  " << gtsam::DefaultKeyFormatter(key_value.key) 
+                << " [shape=box];" << std::endl;
+      }
+      
+      // Add edges for factors
+      for (size_t i = 0; i < graph.size(); ++i) {
+        if (graph[i] && graph[i]->size() > 1) {
+          auto keys = graph[i]->keys();
+          for (size_t j = 1; j < keys.size(); ++j) {
+            dot_file << "  " << gtsam::DefaultKeyFormatter(keys[0]) 
+                    << " -> " << gtsam::DefaultKeyFormatter(keys[j])
+                    << " [label=\"F" << i << "\"];" << std::endl;
+          }
+        }
+      }
+      
+      dot_file << "}" << std::endl;
+      dot_file.close();
+    }
+    
+    logger.error("=== Factor Graph Debug Info saved ===\n");
+    
+  } catch (const std::exception& e) {
+    logger.error("Failed to save factor graph debug info: " + std::string(e.what()));
+  }
+}
 
 KimeraIntegrationInterface::KimeraIntegrationInterface(fgo::core::ApplicationInterface& app)
     : app_(&app) {
@@ -253,10 +351,16 @@ OptimizationResult KimeraIntegrationInterface::optimize() {
     // Construct factor graph from buffered timestamps
     auto status = graph_->constructFactorGraphFromTimestamps(bufferedStateTimestamps_);
     
-    if (status != fgo::graph::StatusGraphConstruction::SUCCESSFUL) {
+    if (status == fgo::graph::StatusGraphConstruction::FAILED) {
       app_->getLogger().error("KimeraIntegrationInterface: Factor graph construction failed");
       result.error_message = "Factor graph construction failed";
       return result;
+    } else if (status == fgo::graph::StatusGraphConstruction::NO_OPTIMIZATION) {
+        app_->getLogger().warn("KimeraIntegrationInterface: Skipping optimization as per graph construction status.");
+        result.success = true;
+        result.optimization_time_ms = 0;
+        result.num_states = 0;
+        return result;
     }
     
     // Run optimization
@@ -284,6 +388,22 @@ OptimizationResult KimeraIntegrationInterface::optimize() {
   } catch (const std::exception& e) {
     app_->getLogger().error("KimeraIntegrationInterface: Exception during optimization: " + 
                             std::string(e.what()));
+    
+    // Save debug information: factor graph keys, .g2o and .dot files
+    if (graph_) {
+      app_->getLogger().error("KimeraIntegrationInterface: Saving factor graph debug information...");
+      try {
+        // Get the current factor graph and values from the graph object
+        // GraphBase inherits from NonlinearFactorGraph, so we can cast
+        const gtsam::NonlinearFactorGraph& current_graph = *graph_;
+        const gtsam::Values& current_values = graph_->getValues();
+        
+        saveFactorGraphDebugInfo(current_graph, current_values, "online_fgo_exception", app_->getLogger());
+      } catch (const std::exception& debug_e) {
+        app_->getLogger().error("Failed to save debug info: " + std::string(debug_e.what()));
+      }
+    }
+    
     result.error_message = std::string("Exception: ") + e.what();
     return result;
   }

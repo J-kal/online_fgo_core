@@ -180,6 +180,11 @@ StatusGraphConstruction GraphTimeCentricKimera::constructFactorGraphFromTimestam
     appPtr_->getLogger().error("GraphTimeCentricKimera: No timestamps provided for graph construction");
     return StatusGraphConstruction::FAILED;
   }
+
+  if (timestamps.size() < 2) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera: Not enough timestamps to construct a factor graph. Need at least 2.");
+    return StatusGraphConstruction::NO_OPTIMIZATION;
+  }
   
   std::cout << "[online_fgo_core] GraphTimeCentricKimera: CONSTRUCT FACTOR GRAPH FROM " << timestamps.size() << " TIMESTAMPS" << std::endl;
   
@@ -231,26 +236,27 @@ StatusGraphConstruction GraphTimeCentricKimera::constructFactorGraphFromTimestam
     
     // Add IMU factor
     if (!addIMUFactorBetweenStates(state_i, state_j, imu_between)) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to add IMU factor between states " + 
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to add IMU factor between states " +
                                  std::to_string(state_i) + " and " + std::to_string(state_j));
       return StatusGraphConstruction::FAILED;
     }
-  }
-  
-  // Add GP motion priors if enabled
-  if (kimeraParams_.addGPMotionPriors) {
-    if (!addGPMotionPriorsForStates(created_states)) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to add GP motion priors");
-      return StatusGraphConstruction::FAILED;
+
+    // Also add GP motion prior if enabled
+    if (kimeraParams_.addGPMotionPriors) {
+      if (!addGPMotionPriorBetweenStates(state_i, state_j)) {
+        appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to add GP motion prior between states " +
+                                   std::to_string(state_i) + " and " + std::to_string(state_j));
+        return StatusGraphConstruction::FAILED;
+      }
     }
   }
-  
+
   appPtr_->getLogger().info("GraphTimeCentricKimera: Factor graph construction successful");
   return StatusGraphConstruction::SUCCESSFUL;
 }
 
 bool GraphTimeCentricKimera::addIMUFactorBetweenStates(
-    size_t state_i_idx, 
+    size_t state_i_idx,
     size_t state_j_idx,
     const std::vector<fgo::data::IMUMeasurement>& imu_measurements) {
   
@@ -319,24 +325,22 @@ bool GraphTimeCentricKimera::addIMUFactorBetweenStates(
 bool GraphTimeCentricKimera::addGPMotionPriorsForStates(const std::vector<size_t>& state_indices) {
   if (state_indices.size() < 2) {
     appPtr_->getLogger().warn("GraphTimeCentricKimera: Need at least 2 states for GP priors");
-    return false;
+    return true;
   }
-  
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Adding GP motion priors for " + 
+
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Adding GP motion priors for " +
                             std::to_string(state_indices.size() - 1) + " state pairs");
-  
-  size_t priors_added = 0;
-  
+
   for (size_t i = 1; i < state_indices.size(); ++i) {
-    if (addGPMotionPriorBetweenStates(state_indices[i-1], state_indices[i])) {
-      priors_added++;
+    if (!addGPMotionPriorBetweenStates(state_indices[i-1], state_indices[i])) {
+      return false;
     }
   }
-  
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Successfully added " + 
-                            std::to_string(priors_added) + " GP motion priors");
-  
-  return (priors_added > 0);
+
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Successfully added " +
+                            std::to_string(state_indices.size() - 1) + " GP motion priors");
+
+  return true;
 }
 
 bool GraphTimeCentricKimera::addGPMotionPriorBetweenStates(size_t state_i_idx, size_t state_j_idx) {
@@ -350,53 +354,53 @@ bool GraphTimeCentricKimera::addGPMotionPriorBetweenStates(size_t state_i_idx, s
     gtsam::Key vel_j = V(state_j_idx);
     gtsam::Key omega_j = W(state_j_idx);
     gtsam::Key acc_j = A(state_j_idx);
-    
+
     // Calculate dt
     double ts_i = keyTimestampMap_[pose_i];
     double ts_j = keyTimestampMap_[pose_j];
     double dt = ts_j - ts_i;
-    
+
     if (dt <= 0.0) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: Invalid dt " + std::to_string(dt) + 
-                                 " between states " + std::to_string(state_i_idx) + 
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Invalid dt " + std::to_string(dt) +
+                                 " between states " + std::to_string(state_i_idx) +
                                  " and " + std::to_string(state_j_idx));
       return false;
     }
-    
+
     // Get acceleration values if needed for WNOJ/WNOJFull
     gtsam::Vector6 acc_i_val = gtsam::Vector6::Zero();
     gtsam::Vector6 acc_j_val = gtsam::Vector6::Zero();
-    
-    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJ || 
+
+    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJ ||
         graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJFull ||
         graphBaseParamPtr_->gpType == fgo::data::GPModelType::Singer ||
         graphBaseParamPtr_->gpType == fgo::data::GPModelType::SingerFull) {
-      
+
       // Try to get from accBuffer or use zero
       if (accBuffer_.size() > state_i_idx) {
         acc_i_val = accBuffer_.get_buffer_from_id(state_i_idx);
       }
-      
+
       if (accBuffer_.size() > state_j_idx) {
         acc_j_val = accBuffer_.get_buffer_from_id(state_j_idx);
       }
     }
-    
+
     // Call base class helper to add GP prior
     gtsam::Matrix6 ad = gtsam::Matrix6::Identity();
-    
+
     this->addGPMotionPrior(pose_i, vel_i, omega_i, acc_i,
                           pose_j, vel_j, omega_j, acc_j,
                           dt, acc_i_val, acc_j_val, ad);
-    
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added GP motion prior between states " + 
-                               std::to_string(state_i_idx) + " and " + 
+
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added GP motion prior between states " +
+                               std::to_string(state_i_idx) + " and " +
                                std::to_string(state_j_idx) + " (dt=" + std::to_string(dt) + ")");
-    
+
     return true;
-    
+
   } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception while adding GP prior: " + 
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception while adding GP prior: " +
                                std::string(e.what()));
     return false;
   }
@@ -640,28 +644,21 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
     // Update currentKeyIndexTimestampMap_
     currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
     
-    // If GP factors enabled, also insert omega and acc keys
-    if (graphBaseParamPtr_->addGPPriorFactor || graphBaseParamPtr_->addGPInterpolatedFactor) {
-      gtsam::Key omega_key = W(state_idx);
-      values_.insert(omega_key, predicted_state.omega);
-      keyTimestampMap_[omega_key] = timestamp;
-    }
-    
-    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJFull || 
-        graphBaseParamPtr_->gpType == fgo::data::GPModelType::SingerFull ||
-        graphBaseParamPtr_->addConstantAccelerationFactor) {
-      gtsam::Key acc_key = A(state_idx);
-      
-      // Get acceleration from buffer if available, otherwise use zero
-      gtsam::Vector6 acc = gtsam::Vector6::Zero();
-      if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
-        acc = accBuffer_.get_buffer_from_id(state_idx - 1);
-      }
-      
-      values_.insert(acc_key, acc);
-      keyTimestampMap_[acc_key] = timestamp;
-    }
-    
+        // If GP factors enabled, also insert omega and acc keys
+        if (kimeraParams_.addGPMotionPriors) {
+          gtsam::Key omega_key = W(state_idx);
+          values_.insert(omega_key, predicted_state.omega);
+          keyTimestampMap_[omega_key] = timestamp;
+          
+          gtsam::Key acc_key = A(state_idx);
+          // Get acceleration from buffer if available, otherwise use zero
+          gtsam::Vector6 acc = gtsam::Vector6::Zero();
+          if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
+            acc = accBuffer_.get_buffer_from_id(state_idx - 1);
+          }
+          values_.insert(acc_key, acc);
+          keyTimestampMap_[acc_key] = timestamp;
+        }    
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " + 
                                std::to_string(state_idx) + " at timestamp " + 
                                std::to_string(timestamp));
