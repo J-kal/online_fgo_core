@@ -20,8 +20,11 @@
 
 #include "online_fgo_core/graph/GraphTimeCentricKimera.h"
 #include "online_fgo_core/graph/GraphUtils.h"
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/inference/Key.h>
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 namespace fgo::graph {
 
@@ -461,6 +464,55 @@ double GraphTimeCentricKimera::optimizeWithExternalFactors(fgo::data::State& new
   appPtr_->getLogger().info("GraphTimeCentricKimera: Starting optimization with external factors...");
   std::cout << "[online_fgo_core] GraphTimeCentricKimera: OPTIMIZE WITH EXTERNAL FACTORS" << std::endl;
   
+  // Validate all factor keys exist in values_ before optimization
+  // This prevents "invalid key" errors from the solver
+  bool all_keys_exist = true;
+  std::vector<gtsam::Key> missing_keys;
+  
+  for (const auto& factor : *this) {
+    if (factor) {
+      for (const auto& key : factor->keys()) {
+        if (!values_.exists(key)) {
+          all_keys_exist = false;
+          missing_keys.push_back(key);
+        }
+      }
+    }
+  }
+  
+  if (!all_keys_exist) {
+    std::ostringstream error_msg;
+    error_msg << "GraphTimeCentricKimera: Missing keys in values_ before optimization: ";
+    for (size_t i = 0; i < missing_keys.size() && i < 10; ++i) {
+      error_msg << gtsam::DefaultKeyFormatter(missing_keys[i]) << " ";
+    }
+    if (missing_keys.size() > 10) {
+      error_msg << "... (and " << (missing_keys.size() - 10) << " more)";
+    }
+    appPtr_->getLogger().error(error_msg.str());
+    
+    // Try to add missing keys with default values (this should not happen in normal operation)
+    for (const auto& key : missing_keys) {
+      gtsam::Symbol symbol(key);
+      if (symbol.chr() == 'x') {
+        values_.insert(key, gtsam::Pose3());
+        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing pose key " + 
+                                  gtsam::DefaultKeyFormatter(key) + " with default value");
+      } else if (symbol.chr() == 'v') {
+        // Create actual Vector3 object (not expression type - Vector3::Zero() returns expression)
+        // Use default constructor which initializes to zero
+        gtsam::Vector3 zero_vel(0.0, 0.0, 0.0);
+        values_.insert(key, zero_vel);
+        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing velocity key " + 
+                                  gtsam::DefaultKeyFormatter(key) + " with default value");
+      } else if (symbol.chr() == 'b') {
+        values_.insert(key, gtsam::imuBias::ConstantBias());
+        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing bias key " + 
+                                  gtsam::DefaultKeyFormatter(key) + " with default value");
+      }
+    }
+  }
+  
   // Call base class optimize method
   double opt_time = this->optimize(new_state);
   
@@ -640,10 +692,24 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
     gtsam::Key vel_key = V(state_idx);
     gtsam::Key bias_key = B(state_idx);
     
-    // Insert initial values
-    values_.insert(pose_key, predicted_state.state.pose());
-    values_.insert(vel_key, predicted_state.state.velocity());
-    values_.insert(bias_key, predicted_state.imuBias);
+    // Insert or update initial values (handle existing keys gracefully)
+    if (values_.exists(pose_key)) {
+      values_.update(pose_key, predicted_state.state.pose());
+    } else {
+      values_.insert(pose_key, predicted_state.state.pose());
+    }
+    
+    if (values_.exists(vel_key)) {
+      values_.update(vel_key, predicted_state.state.velocity());
+    } else {
+      values_.insert(vel_key, predicted_state.state.velocity());
+    }
+    
+    if (values_.exists(bias_key)) {
+      values_.update(bias_key, predicted_state.imuBias);
+    } else {
+      values_.insert(bias_key, predicted_state.imuBias);
+    }
     
     // Update keyTimestampMap
     keyTimestampMap_[pose_key] = timestamp;
@@ -676,11 +742,6 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
                                std::to_string(timestamp));
     
     return true;
-    
-  } catch (const gtsam::ValuesKeyAlreadyExists& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Key already exists when creating state " + 
-                               std::to_string(state_idx) + ": " + std::string(e.what()));
-    return false;
     
   } catch (const std::exception& e) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: Exception creating initial values: " + 

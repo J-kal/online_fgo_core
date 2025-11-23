@@ -213,7 +213,7 @@ namespace fgo::integration {
 
 
     /**
-     * @brief Add preintegrated IMU measurements (PIM) for keyframes
+     * @brief Add preintegrated IMU measurements (PIM) for keyframes (batch mode)
      * 
      * This method accepts preintegrated IMU measurements from Kimera's frontend.
      * The PIM values are stored and used to create IMU factors between consecutive
@@ -222,9 +222,35 @@ namespace fgo::integration {
      * @param pim_data Vector of (timestamp, PIM) pairs
      *                  PIM[i] is preintegration from keyframe[i-1] to keyframe[i]
      * @return true if successfully added
+     * 
+     * @deprecated Use addKeyframeWithPIM() for incremental processing (matches vioBackend behavior)
      */
     bool addPreintegratedIMUData(
         const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data);
+
+    /**
+     * @brief Add a keyframe with PIM incrementally (matches vioBackend behavior)
+     * 
+     * This method mimics the incremental processing used by vioBackend:
+     * 1. Creates state at timestamp
+     * 2. Adds IMU factor from PIM (between last keyframe and current)
+     * 3. Optionally optimizes immediately if optimize_on_keyframe is true
+     * 
+     * This is the recommended way to add keyframes for live feeds.
+     * 
+     * @param timestamp Keyframe timestamp in seconds
+     * @param pose Initial pose estimate
+     * @param velocity Initial velocity estimate
+     * @param bias Initial IMU bias estimate
+     * @param pim Preintegrated IMU measurements from last keyframe to this one
+     * @return StateHandle if successful, invalid handle otherwise
+     */
+    StateHandle addKeyframeWithPIM(
+        double timestamp,
+        const gtsam::Pose3& pose,
+        const gtsam::Vector3& velocity,
+        const gtsam::imuBias::ConstantBias& bias,
+        std::shared_ptr<gtsam::PreintegrationType> pim);
 
     // ========================================================================
     // FACTOR INSERTION (Future use for visual factors)
@@ -361,6 +387,9 @@ namespace fgo::integration {
     
     // Buffered state timestamps (for batched optimization)
     std::vector<double> bufferedStateTimestamps_;
+    
+    // Last keyframe state index (for incremental processing)
+    size_t last_keyframe_state_idx_ = 0;
     
   };
 

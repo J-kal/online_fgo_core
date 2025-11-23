@@ -312,6 +312,70 @@ bool KimeraIntegrationInterface::addPreintegratedIMUData(
   }
 }
 
+StateHandle KimeraIntegrationInterface::addKeyframeWithPIM(
+    double timestamp,
+    const gtsam::Pose3& pose,
+    const gtsam::Vector3& velocity,
+    const gtsam::imuBias::ConstantBias& bias,
+    std::shared_ptr<gtsam::PreintegrationType> pim) {
+  
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return StateHandle();
+  }
+  
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD KEYFRAME WITH PIM AT TIMESTAMP " 
+            << timestamp << std::endl;
+  
+  try {
+    // 1. Create state at timestamp (or find existing)
+    size_t current_state_idx = graph_->findOrCreateStateForTimestamp(timestamp, true);
+    
+    if (current_state_idx == 0) {
+      app_->getLogger().error("KimeraIntegrationInterface: Failed to create state at timestamp " + 
+                              std::to_string(timestamp));
+      return StateHandle();
+    }
+    
+    // 2. Set initial values for the state
+    if (!graph_->setStateInitialValues(current_state_idx, pose, velocity, bias)) {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to set initial values for state " + 
+                             std::to_string(current_state_idx));
+    }
+    
+    // 3. If PIM is provided and this is not the first keyframe, add IMU factor incrementally
+    if (pim && last_keyframe_state_idx_ != 0 && last_keyframe_state_idx_ != current_state_idx) {
+      // Add IMU factor between previous and current keyframe
+      if (!graph_->addIMUFactorFromPIM(last_keyframe_state_idx_, current_state_idx, *pim)) {
+        app_->getLogger().warn("KimeraIntegrationInterface: Failed to add IMU factor from PIM");
+      } else {
+        app_->getLogger().debug("KimeraIntegrationInterface: Added IMU factor from state " + 
+                                std::to_string(last_keyframe_state_idx_) + " to " + 
+                                std::to_string(current_state_idx));
+      }
+    }
+    // For first keyframe (last_keyframe_state_idx_ == 0), PIM is not used (no previous keyframe to connect to)
+    
+    // 4. Update last keyframe state index
+    last_keyframe_state_idx_ = current_state_idx;
+    
+    // 5. If optimize_on_keyframe is true, optimize immediately (incremental)
+    if (params_.optimize_on_keyframe) {
+      fgo::data::State optimized_state;
+      double opt_time = graph_->optimizeWithExternalFactors(optimized_state);
+      app_->getLogger().info("KimeraIntegrationInterface: Incremental optimization completed in " + 
+                             std::to_string(opt_time) + " seconds");
+    }
+    
+    return StateHandle(current_state_idx, timestamp);
+    
+  } catch (const std::exception& e) {
+    app_->getLogger().error("KimeraIntegrationInterface: Exception adding keyframe with PIM: " + 
+                            std::string(e.what()));
+    return StateHandle();
+  }
+}
+
 // ========================================================================
 // FACTOR INSERTION
 // ========================================================================
