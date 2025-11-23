@@ -174,6 +174,23 @@ namespace fgo::integration {
     StateHandle createStateAtTimestamp(double timestamp);
 
     /**
+     * @brief Create a new state at the specified timestamp with initial values
+     * 
+     * Creates a state and sets its initial pose, velocity, and bias values.
+     * This is used when we have initial estimates from Kimera's backend.
+     * 
+     * @param timestamp Timestamp in seconds
+     * @param pose Initial pose estimate
+     * @param velocity Initial velocity estimate
+     * @param bias Initial IMU bias estimate
+     * @return StateHandle for the created/existing state
+     */
+    StateHandle createStateAtTimestamp(double timestamp,
+                                      const gtsam::Pose3& pose,
+                                      const gtsam::Vector3& velocity,
+                                      const gtsam::imuBias::ConstantBias& bias);
+
+    /**
      * @brief Get existing state at timestamp
      * @param timestamp Timestamp in seconds
      * @return StateHandle if state exists, invalid handle otherwise
@@ -194,37 +211,20 @@ namespace fgo::integration {
     // IMU DATA HANDLING
     // ========================================================================
 
-    /**
-     * @brief Add a single IMU measurement
-     * @param timestamp Timestamp in seconds
-     * @param accel Linear acceleration in m/s^2
-     * @param gyro Angular velocity in rad/s
-     * @param dt Time delta from previous measurement
-     * @return true if successfully added
-     * 
-     * TODO: Convert to fgo::data::IMUMeasurement
-     * TODO: Add to graph via graph_->addIMUMeasurements()
-     */
-    bool addIMUData(double timestamp, 
-                    const Eigen::Vector3d& accel, 
-                    const Eigen::Vector3d& gyro, 
-                    double dt);
 
     /**
-     * @brief Add multiple IMU measurements in batch
-     * @param timestamps Vector of timestamps in seconds
-     * @param accels Vector of accelerations
-     * @param gyros Vector of gyros
-     * @param dts Vector of time deltas
-     * @return Number of measurements successfully added
+     * @brief Add preintegrated IMU measurements (PIM) for keyframes
      * 
-     * TODO: Convert to vector of fgo::data::IMUMeasurement
-     * TODO: Add to graph in batch
+     * This method accepts preintegrated IMU measurements from Kimera's frontend.
+     * The PIM values are stored and used to create IMU factors between consecutive
+     * keyframe states during graph construction.
+     * 
+     * @param pim_data Vector of (timestamp, PIM) pairs
+     *                  PIM[i] is preintegration from keyframe[i-1] to keyframe[i]
+     * @return true if successfully added
      */
-    size_t addIMUDataBatch(const std::vector<double>& timestamps,
-                           const std::vector<Eigen::Vector3d>& accels,
-                           const std::vector<Eigen::Vector3d>& gyros,
-                           const std::vector<double>& dts);
+    bool addPreintegratedIMUData(
+        const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data);
 
     // ========================================================================
     // FACTOR INSERTION (Future use for visual factors)
@@ -362,22 +362,6 @@ namespace fgo::integration {
     // Buffered state timestamps (for batched optimization)
     std::vector<double> bufferedStateTimestamps_;
     
-    /**
-     * @brief Helper: Convert Eigen vectors to fgo::data::IMUMeasurement
-     * @param timestamp Timestamp
-     * @param accel Acceleration
-     * @param gyro Gyro
-     * @param dt Time delta
-     * @return IMUMeasurement
-     * 
-     * TODO: Populate all fields of IMUMeasurement struct
-     * TODO: Set covariances from params
-     */
-    fgo::data::IMUMeasurement convertToIMUMeasurement(
-        double timestamp,
-        const Eigen::Vector3d& accel,
-        const Eigen::Vector3d& gyro,
-        double dt);
   };
 
 } // namespace fgo::integration

@@ -28,6 +28,8 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
+// PreintegrationType is defined in CombinedImuFactor.h, no separate header needed
+#include <gtsam/navigation/CombinedImuFactor.h>
 #include <mutex>
 #include <map>
 #include <unordered_map>
@@ -37,6 +39,8 @@ namespace fgo::graph {
 
 /**
  * @brief Parameters specific to Kimera VIO integration
+ * 
+ * Initialization parameters match Kimera-VIO's BackendParams for consistency
  */
 struct GraphTimeCentricKimeraParams {
   // State creation
@@ -58,6 +62,18 @@ struct GraphTimeCentricKimeraParams {
   
   // Optimization
   bool optimizeOnKeyframe = true;          // Trigger optimization on keyframe arrival
+  
+  // Initialization parameters (matching Kimera-VIO BackendParams)
+  // These control the noise models for prior factors on the first state
+  // IMPORTANT: These MUST be loaded from BackendParams.yaml via initializeKimeraSupport()
+  // Default values are defined in initializeKimeraSupport() to match BackendParams.yaml
+  // No defaults here to ensure BackendParams.yaml is the single source of truth
+  double initialPositionSigma;       // Position uncertainty (m) - loaded from BackendParams.yaml
+  double initialRollPitchSigma;      // Roll/Pitch uncertainty (rad) - loaded from BackendParams.yaml
+  double initialYawSigma;            // Yaw uncertainty (rad) - loaded from BackendParams.yaml
+  double initialVelocitySigma;       // Velocity uncertainty (m/s) - loaded from BackendParams.yaml
+  double initialAccBiasSigma;        // Accelerometer bias uncertainty (m/s²) - loaded from BackendParams.yaml
+  double initialGyroBiasSigma;       // Gyroscope bias uncertainty (rad/s) - loaded from BackendParams.yaml
   
   GraphTimeCentricKimeraParams() = default;
 };
@@ -184,15 +200,6 @@ public:
     // IMU MEASUREMENT HANDLING - Buffer and integrate IMU data
     // ========================================================================
 
-    /**
-     * @brief Add IMU measurements to internal buffer
-     * @param imu_measurements Vector of IMU measurements
-     * @return true if successfully buffered
-     * 
-     * TODO: Buffer measurements in kimeraIMUBuffer_
-     * TODO: Sort by timestamp if needed
-     */
-    bool addIMUMeasurements(const std::vector<fgo::data::IMUMeasurement>& imu_measurements);
 
     /**
      * @brief Construct factor graph from explicit list of timestamps
@@ -213,20 +220,35 @@ public:
     StatusGraphConstruction constructFactorGraphFromTimestamps(
         const std::vector<double>& timestamps);
 
+
     /**
-     * @brief Construct IMU factors between two specific states
-     * @param state_i_idx Index of state i
-     * @param state_j_idx Index of state j  
-     * @param imu_measurements IMU measurements to integrate
-     * @return true if factor added successfully
+     * @brief Add IMU factor between two states using preintegrated measurements (PIM)
      * 
-     * TODO: Create CombinedImuFactor between the two states
-     * TODO: Use preIntegratorParams_ from base class
+     * This method uses a preintegrated PIM object (from Kimera frontend) directly,
+     * avoiding the need to re-preintegrate raw IMU measurements.
+     * 
+     * @param state_i_idx Index of state i (previous keyframe)
+     * @param state_j_idx Index of state j (current keyframe)
+     * @param pim Preintegrated IMU measurements between states
+     * @return true if factor added successfully
      */
-    bool addIMUFactorBetweenStates(
-        size_t state_i_idx, 
+    bool addIMUFactorFromPIM(
+        size_t state_i_idx,
         size_t state_j_idx,
-        const std::vector<fgo::data::IMUMeasurement>& imu_measurements);
+        const gtsam::PreintegrationType& pim);
+
+    /**
+     * @brief Add preintegrated IMU data for later factor creation
+     * 
+     * Stores PIM values that will be used to create IMU factors between
+     * consecutive keyframe states during graph construction.
+     * 
+     * @param pim_data Vector of (timestamp, PIM) pairs
+     *                  PIM[i] is preintegration from keyframe[i-1] to keyframe[i]
+     * @return true if successfully stored
+     */
+    bool addPreintegratedIMUData(
+        const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data);
 
     // ========================================================================
     // GP MOTION PRIORS - Gaussian Process motion model
@@ -447,6 +469,22 @@ public:
       return kimeraParams_;
     }
 
+    /**
+     * @brief Set initial values for an existing state from Kimera estimates
+     * @param state_idx State index
+     * @param pose Initial pose estimate
+     * @param velocity Initial velocity estimate
+     * @param bias Initial IMU bias estimate
+     * @return true if values set successfully
+     * 
+     * This method updates the initial values for a state that was already created.
+     * Used when we have better initial estimates from Kimera's backend.
+     */
+    bool setStateInitialValues(size_t state_idx,
+                               const gtsam::Pose3& pose,
+                               const gtsam::Vector3& velocity,
+                               const gtsam::imuBias::ConstantBias& bias);
+
 protected:
     // ========================================================================
     // MEMBER VARIABLES
@@ -458,8 +496,13 @@ protected:
     // State tracking - Maps timestamp -> state index for fast lookup
     std::unordered_map<double, size_t> timestampToStateIndex_;
 
-    // IMU measurement buffer (separate from GraphTimeCentric's dataIMURest_)
-    std::vector<fgo::data::IMUMeasurement> kimeraIMUBuffer_;
+    // Preintegrated IMU measurements (PIM) from Kimera frontend
+    // PIM[i] is preintegration from keyframe[i-1] to keyframe[i]
+    // Stored as (timestamp, PIM) pairs where timestamp is the destination keyframe
+    std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>> stored_pims_;
+
+    // Track if prior factors have been added to the first state
+    bool first_state_priors_added_ = false;
 
     // Smart factors for new landmarks (not yet added to graph)
     LandmarkIdSmartFactorMap new_smart_factors_;
@@ -491,6 +534,18 @@ protected:
      * TODO: Optionally insert W, A keys if GP factors enabled
      */
     bool createInitialValuesForState(size_t state_idx, double timestamp);
+
+    /**
+     * @brief Helper: Add prior factors to the first state to constrain the system
+     * @param state_idx State index (should be 1 for first state)
+     * @param timestamp State timestamp
+     * @return true if priors added successfully
+     * 
+     * Adds PriorFactor for pose, velocity, and bias to make the system well-constrained.
+     * Uses parameters loaded from BackendParams.yaml via initializeKimeraSupport().
+     * Matches Kimera-VIO's addInitialPriorFactors() approach.
+     */
+    bool addPriorFactorsToFirstState(size_t state_idx, double timestamp);
 
     /**
      * @brief Helper: Update timestamp to state index mapping

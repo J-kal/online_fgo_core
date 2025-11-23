@@ -146,7 +146,8 @@ bool KimeraIntegrationInterface::initialize(const KimeraIntegrationParams& param
     kimera_params.createStatesAtIMURate = true;
     kimera_params.imuStateFrequency = params.imu_rate;
     kimera_params.useCombinedIMUFactor = true;
-    kimera_params.addGPMotionPriors = params.use_gp_priors;
+    // kimera_params.addGPMotionPriors = params.use_gp_priors;  // COMMENTED OUT FOR IMU ISOLATION TESTING
+    kimera_params.addGPMotionPriors = false;  // Disabled for IMU testing
     kimera_params.optimizeOnKeyframe = params.optimize_on_keyframe;
     
     graph_->setKimeraParams(kimera_params);
@@ -206,6 +207,54 @@ StateHandle KimeraIntegrationInterface::createStateAtTimestamp(double timestamp)
   }
 }
 
+StateHandle KimeraIntegrationInterface::createStateAtTimestamp(double timestamp,
+                                                                const gtsam::Pose3& pose,
+                                                                const gtsam::Vector3& velocity,
+                                                                const gtsam::imuBias::ConstantBias& bias) {
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return StateHandle();
+  }
+  
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: CREATE STATE AT TIMESTAMP " << timestamp 
+            << " WITH INITIAL VALUES" << std::endl;
+  
+  try {
+    // Create state (or find existing)
+    size_t state_idx = graph_->findOrCreateStateForTimestamp(timestamp, true);
+    
+    if (state_idx == 0) {
+      app_->getLogger().error("KimeraIntegrationInterface: Failed to create state at timestamp " + 
+                              std::to_string(timestamp));
+      return StateHandle();
+    }
+    
+    // PRIORITY FIX #2: Set initial values from Kimera estimates
+    // This ensures the state has proper initial estimates instead of relying on predicted buffer
+    if (!graph_->setStateInitialValues(state_idx, pose, velocity, bias)) {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to set initial values for state " + 
+                             std::to_string(state_idx) + ", using default values");
+    } else {
+      app_->getLogger().debug("KimeraIntegrationInterface: Set initial values for state " + 
+                              std::to_string(state_idx));
+    }
+    
+    // Add to buffered timestamps for optimization
+    bufferedStateTimestamps_.push_back(timestamp);
+    
+    app_->getLogger().debug("KimeraIntegrationInterface: Created state " + 
+                            std::to_string(state_idx) + " at timestamp " + 
+                            std::to_string(timestamp) + " with initial values");
+    
+    return StateHandle(state_idx, timestamp);
+    
+  } catch (const std::exception& e) {
+    app_->getLogger().error("KimeraIntegrationInterface: Exception creating state with initial values: " + 
+                            std::string(e.what()));
+    return StateHandle();
+  }
+}
+
 StateHandle KimeraIntegrationInterface::getStateAtTimestamp(double timestamp) {
   if (!initialized_) {
     app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
@@ -236,74 +285,30 @@ std::vector<double> KimeraIntegrationInterface::getAllStateTimestamps() {
   return graph_->getAllStateTimestamps();
 }
 
-// ========================================================================
-// IMU DATA HANDLING
-// ========================================================================
 
-bool KimeraIntegrationInterface::addIMUData(double timestamp, 
-                                            const Eigen::Vector3d& accel, 
-                                            const Eigen::Vector3d& gyro, 
-                                            double dt) {
+bool KimeraIntegrationInterface::addPreintegratedIMUData(
+    const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data) {
   if (!initialized_) {
     app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
     return false;
   }
   
-  std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD IMU DATA AT TIMESTAMP " << timestamp << std::endl;
-  
-  try {
-    // Convert to fgo::data::IMUMeasurement
-    fgo::data::IMUMeasurement imu_meas = convertToIMUMeasurement(timestamp, accel, gyro, dt);
-    
-    // Add to graph
-    std::vector<fgo::data::IMUMeasurement> imu_vec = {imu_meas};
-    return graph_->addIMUMeasurements(imu_vec);
-    
-  } catch (const std::exception& e) {
-    app_->getLogger().error("KimeraIntegrationInterface: Exception adding IMU data: " + 
-                            std::string(e.what()));
+  if (pim_data.empty()) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Empty PIM data provided");
     return false;
   }
-}
-
-size_t KimeraIntegrationInterface::addIMUDataBatch(const std::vector<double>& timestamps,
-                                                    const std::vector<Eigen::Vector3d>& accels,
-                                                    const std::vector<Eigen::Vector3d>& gyros,
-                                                    const std::vector<double>& dts) {
-  if (!initialized_) {
-    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
-    return 0;
-  }
   
-  if (!timestamps.empty()) {
-    std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD IMU DATA BATCH, " << timestamps.size() << " measurements, from " << timestamps.front() << " to " << timestamps.back() << std::endl;
-  }
-  
-  if (timestamps.size() != accels.size() || 
-      timestamps.size() != gyros.size() || 
-      timestamps.size() != dts.size()) {
-    app_->getLogger().error("KimeraIntegrationInterface: Inconsistent batch sizes");
-    return 0;
-  }
+  std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD PREINTEGRATED IMU DATA, " 
+            << pim_data.size() << " PIM values" << std::endl;
   
   try {
-    std::vector<fgo::data::IMUMeasurement> imu_measurements;
-    imu_measurements.reserve(timestamps.size());
-    
-    for (size_t i = 0; i < timestamps.size(); ++i) {
-      imu_measurements.push_back(convertToIMUMeasurement(timestamps[i], accels[i], gyros[i], dts[i]));
-    }
-    
-    if (graph_->addIMUMeasurements(imu_measurements)) {
-      return timestamps.size();
-    }
-    
-    return 0;
+    // Forward to graph for storage and later use in factor construction
+    return graph_->addPreintegratedIMUData(pim_data);
     
   } catch (const std::exception& e) {
-    app_->getLogger().error("KimeraIntegrationInterface: Exception adding batch IMU data: " + 
+    app_->getLogger().error("KimeraIntegrationInterface: Exception adding preintegrated IMU data: " + 
                             std::string(e.what()));
-    return 0;
+    return false;
   }
 }
 
@@ -523,44 +528,5 @@ void KimeraIntegrationInterface::updateParameters(const KimeraIntegrationParams&
   }
 }
 
-// ========================================================================
-// HELPER METHODS
-// ========================================================================
-
-fgo::data::IMUMeasurement KimeraIntegrationInterface::convertToIMUMeasurement(
-    double timestamp,
-    const Eigen::Vector3d& accel,
-    const Eigen::Vector3d& gyro,
-    double dt) {
-  
-  fgo::data::IMUMeasurement imu_meas;
-  
-  // Set timestamp
-  imu_meas.timestamp = fgo::core::TimeStamp(timestamp);
-  
-  // Set linear acceleration
-  imu_meas.accLin = gtsam::Vector3(accel.x(), accel.y(), accel.z());
-  
-  // Set gyro
-  imu_meas.gyro = gtsam::Vector3(gyro.x(), gyro.y(), gyro.z());
-  
-  // Set dt
-  imu_meas.dt = dt;
-  
-  // Set rotational acceleration (optional, zero for now)
-  imu_meas.accRot = gtsam::Vector3::Zero();
-  
-  // Set covariances from parameters
-  gtsam::Matrix3 accel_cov = gtsam::Matrix3::Identity() * 
-                             (params_.accel_noise_sigma * params_.accel_noise_sigma);
-  gtsam::Matrix3 gyro_cov = gtsam::Matrix3::Identity() * 
-                            (params_.gyro_noise_sigma * params_.gyro_noise_sigma);
-  
-  imu_meas.accLinCov = accel_cov;
-  imu_meas.gyroCov = gyro_cov;
-  imu_meas.accRotCov = gtsam::Matrix3::Identity() * 1e-6;  // Small default
-  
-  return imu_meas;
-}
 
 } // namespace fgo::integration

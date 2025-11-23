@@ -30,6 +30,17 @@ find_package(GTSAM_UNSTABLE REQUIRED)
 find_package(GeographicLib REQUIRED)
 find_package(TBB REQUIRED COMPONENTS tbb tbbmalloc)
 
+# Determine GeographicLib library to link
+if(TARGET GeographicLib::GeographicLib_SHARED)
+    set(GEOGRAPHICLIB_LIB GeographicLib::GeographicLib_SHARED)
+elseif(TARGET GeographicLib::GeographicLib)
+    set(GEOGRAPHICLIB_LIB GeographicLib::GeographicLib)
+elseif(GeographicLib_LIBRARIES)
+    set(GEOGRAPHICLIB_LIB ${GeographicLib_LIBRARIES})
+else()
+    message(FATAL_ERROR "GeographicLib not found properly")
+endif()
+
 # Optional dependencies
 if(WITH_YAML)
     find_package(yaml-cpp QUIET)
@@ -83,7 +94,7 @@ set(ONLINEFGO_CORE_LINK
     gtsam_unstable
     Eigen3::Eigen
     ${Boost_LIBRARIES}
-    Geographic
+    ${GEOGRAPHICLIB_LIB}
     TBB::tbb
     TBB::tbbmalloc
 )
@@ -116,7 +127,7 @@ target_link_libraries(online_fgo_factors INTERFACE
     gtsam
     gtsam_unstable
     Eigen3::Eigen
-    Geographic
+    ${GEOGRAPHICLIB_LIB}
 )
 
 # Solvers library (with implementation)
@@ -153,7 +164,7 @@ target_link_libraries(online_fgo_utils
         online_fgo_factors
         gtsam
         Eigen3::Eigen
-        Geographic
+        ${GEOGRAPHICLIB_LIB}
 )
 
 # Graph library (with implementation)
@@ -180,7 +191,7 @@ target_link_libraries(online_fgo_graph
         gtsam_unstable
         Eigen3::Eigen
         ${Boost_LIBRARIES}
-        Geographic
+        ${GEOGRAPHICLIB_LIB}
         TBB::tbb
         TBB::tbbmalloc
 )
@@ -209,7 +220,7 @@ target_link_libraries(online_fgo_integrator
         gtsam_unstable
         Eigen3::Eigen
         ${Boost_LIBRARIES}
-        Geographic
+        ${GEOGRAPHICLIB_LIB}
         TBB::tbb
         TBB::tbbmalloc
 )
@@ -238,7 +249,7 @@ target_link_libraries(online_fgo_localization
         gtsam_unstable
         Eigen3::Eigen
         ${Boost_LIBRARIES}
-        Geographic
+        ${GEOGRAPHICLIB_LIB}
         TBB::tbb
         TBB::tbbmalloc
 )
@@ -291,7 +302,8 @@ install(EXPORT online_fgo_core_targets
     DESTINATION lib/cmake/online_fgo_core
 )
 
-# Tests
+# Tests - only build if BUILD_TESTS is explicitly set to ON
+# Ignore CATKIN_ENABLE_TESTING to prevent automatic test building
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
