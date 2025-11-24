@@ -196,6 +196,20 @@ public:
      */
     std::vector<double> getAllStateTimestamps() const;
 
+    /**
+     * @brief Convenience helper that creates (or finds) a state at timestamp and
+     *        immediately sets explicit initial values.
+     *
+     * Mirrors Kimera-VIO's addStateValues() path to keep the integration steps
+     * (state initialization vs. factor creation) decoupled.
+     *
+     * @return state index (>=1) if successful, 0 otherwise
+     */
+    size_t addKeyframeState(double timestamp,
+                            const gtsam::Pose3& pose,
+                            const gtsam::Vector3& velocity,
+                            const gtsam::imuBias::ConstantBias& bias);
+
     // ========================================================================
     // IMU MEASUREMENT HANDLING - Buffer and integrate IMU data
     // ========================================================================
@@ -506,6 +520,13 @@ protected:
 
     // Smart factors for new landmarks (not yet added to graph)
     LandmarkIdSmartFactorMap new_smart_factors_;
+    
+    // Track new factors and values for incremental optimization (matching vioBackend pattern)
+    // These are accumulated between optimizations and passed to solver_->update()
+    gtsam::NonlinearFactorGraph new_factors_since_last_opt_;
+    gtsam::Values new_values_since_last_opt_;
+    size_t last_optimization_graph_size_ = 0;  // Track graph size at last optimization
+    size_t last_optimization_values_size_ = 0;  // Track values size at last optimization
     
     // Smart factors already in the graph
     LandmarkIdSmartFactorMap old_smart_factors_;

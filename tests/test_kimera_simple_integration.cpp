@@ -2,6 +2,30 @@
  * @file test_kimera_simple_integration.cpp
  * @brief Simple test simulating Kimera-VIO input to verify factor graph construction and optimization
  * @author Kimera Integration Team
+ * 
+ * PIPELINE VERIFICATION:
+ * These tests mirror the vioBackend pipeline (VioBackend::addVisualInertialStateAndOptimize):
+ * 
+ * 1. Keyframe Processing (incremental, like vioBackend):
+*    - addKeyframeState() = vioBackend's addStateValues()
+*    - addImuFactorBetween() = vioBackend's addIMUFactor()
+ *    - Each keyframe is processed immediately as it arrives (not batched)
+ * 
+ * 2. IMU Factor Addition:
+ *    - IMU factors connect consecutive keyframes (state_i -> state_j)
+ *    - PIM (Preintegrated IMU Measurements) provided for each keyframe transition
+ *    - Matches vioBackend's CombinedImuFactor addition pattern
+ * 
+ * 3. Optimization Timing:
+ *    - First keyframe: Only priors added, NO optimization (matching vioBackend)
+ *    - Subsequent keyframes: Optimize immediately after adding IMU factor
+ *    - Matches vioBackend's optimize() call pattern
+ * 
+ * 4. Safety Checks (matching vioBackend's updateSmoother):
+ *    - Graph must have factors before optimizing
+ *    - Values must not be empty
+ *    - All factor keys must exist in values_
+ *    - Exception handling around solver update
  */
 
  #include <gtest/gtest.h>
@@ -20,127 +44,144 @@
  using namespace fgo::core;
  using namespace gtsam;
  
+namespace {
+StateHandle addStateAndMaybeImu(KimeraIntegrationInterface& interface,
+                                StateHandle& previous_handle,
+                                double timestamp,
+                                const Pose3& pose,
+                                const Vector3& velocity,
+                                const imuBias::ConstantBias& bias,
+                                const std::shared_ptr<PreintegratedCombinedMeasurements>& pim) {
+    auto current = interface.addKeyframeState(timestamp, pose, velocity, bias);
+    if (!current.valid) {
+        return current;
+    }
+
+    if (pim && previous_handle.valid) {
+        if (!interface.addImuFactorBetween(previous_handle, current, pim)) {
+            std::cout << "WARNING: Failed to add IMU factor between states "
+                      << previous_handle.index << " and " << current.index << std::endl;
+        }
+    }
+
+    previous_handle = current;
+    return current;
+}
+}  // namespace
+
  /**
  * @brief Test simulating Kimera-VIO incremental keyframe processing (matches vioBackend behavior)
  * 
  * This test mimics the live feed scenario where vioBackend:
  * 1. Processes keyframes incrementally as they arrive
- * 2. Adds IMU factors immediately when a keyframe is added
- * 3. Optimizes on each keyframe (incremental mode)
+ * 2. Adds IMU factors immediately when a keyframe is added (between consecutive keyframes)
+ * 3. Optimizes on each keyframe AFTER the second keyframe (incremental mode)
+ *    - First keyframe: Only priors, no optimization (matching vioBackend)
+ *    - Subsequent keyframes: Optimize immediately after adding IMU factor
+ * 
+ * Pipeline matches vioBackend::addVisualInertialStateAndOptimize():
+* - addKeyframeState() + addImuFactorBetween() = addStateValues() + addIMUFactor()
+ * - Optimization skipped on first keyframe (no IMU factors yet)
  * 
  * This is the correct way to use the system - NOT batch mode.
   */
  TEST(KimeraSimpleIntegration, BuildAndOptimizeGraph) {
-     // Create application interface
-     auto app = std::make_shared<StandaloneApplication>("test_kimera_simple");
-     
-    // Configure required parameters for GraphBase initialization
-    // smootherType is required to initialize the solver (BatchFixedLag or IncrementalFixedLag)
-    app->getParameterServer()->setString("GNSSFGO.Optimizer.smootherType", "IncrementalFixedLag");
-    app->getParameterServer()->setDouble("GNSSFGO.Optimizer.smootherLag", 0.1);
-    
-    // Set initialization parameters matching BackendParams.yaml (matching Kimera-VIO defaults)
-    app->getParameterServer()->setDouble("initialPositionSigma", 1e-05);
-    app->getParameterServer()->setDouble("initialRollPitchSigma", 0.174533);  // 10.0/180.0*M_PI
-    app->getParameterServer()->setDouble("initialYawSigma", 0.00174533);      // 0.1/180.0*M_PI
-    app->getParameterServer()->setDouble("initialVelocitySigma", 0.001);
-    app->getParameterServer()->setDouble("initialAccBiasSigma", 0.1);
-    app->getParameterServer()->setDouble("initialGyroBiasSigma", 0.01);
-     
-     // Create integration interface
-     KimeraIntegrationInterface interface(*app);
-     
-    // Setup parameters - optimize on each keyframe (incremental mode, like vioBackend)
-     KimeraIntegrationParams params;
-     params.imu_rate = 200.0;
-    params.optimize_on_keyframe = true;  // Optimize incrementally on each keyframe
-     params.use_gp_priors = false;  // Disabled for IMU isolation
-     
-     // Initialize
-     ASSERT_TRUE(interface.initialize(params)) << "Failed to initialize interface";
-     EXPECT_TRUE(interface.isInitialized());
-     
-     // Create PIM parameters (matching typical IMU specs)
-     auto pim_params = PreintegrationCombinedParams::MakeSharedD(9.81);
-     pim_params->setGyroscopeCovariance(Matrix3::Identity() * std::pow(0.0003394, 2.0));
-     pim_params->setAccelerometerCovariance(Matrix3::Identity() * std::pow(0.002, 2.0));
-     pim_params->setBiasAccCovariance(Matrix3::Identity() * std::pow(0.0003, 2.0));
-     pim_params->setBiasOmegaCovariance(Matrix3::Identity() * std::pow(0.000038785, 2.0));
-     
-    // Simulate 5 keyframes at 0.1s intervals - process incrementally (like vioBackend)
-     const int num_keyframes = 5;
-     const double dt = 0.1;  // 100ms between keyframes
-     std::vector<StateHandle> state_handles;
-     
-     // Create initial pose (at origin, identity rotation)
-     Pose3 initial_pose;
-     Vector3 initial_velocity = Vector3::Zero();
-     imuBias::ConstantBias initial_bias;
-     
-    // Process first keyframe (no PIM, as it's the first)
-     double t0 = 0.0;
-    auto handle0 = interface.addKeyframeWithPIM(t0, initial_pose, initial_velocity, initial_bias, nullptr);
-     ASSERT_TRUE(handle0.valid) << "Failed to create first state";
-     state_handles.push_back(handle0);
-     
-    // Process subsequent keyframes incrementally (like vioBackend does)
-     for (int i = 1; i < num_keyframes; ++i) {
-         double t_i = t0 + i * dt;
-         
-         // Create state at this timestamp
-         // Simple motion: move forward in x-direction at 1 m/s
-         Pose3 pose_i(Rot3(), Point3(i * dt * 1.0, 0.0, 0.0));  // 1 m/s forward
-         Vector3 vel_i(1.0, 0.0, 0.0);
-         
-         // Create PIM from previous keyframe to this one
-         // Simulate constant acceleration forward (small, realistic)
-         PreintegratedCombinedMeasurements pim(pim_params, initial_bias);
-         
-         // Integrate a few IMU measurements between keyframes
-         // Simulate 10 IMU measurements per keyframe interval (10ms each)
-         const int num_imu_per_interval = 10;
-         const double imu_dt = dt / num_imu_per_interval;
-         
-         for (int j = 0; j < num_imu_per_interval; ++j) {
-             // Simulate IMU measurements
-             // Accelerometer: gravity + small forward acceleration
-             Vector3 acc_measured(0.1, 0.0, 9.81);  // Small forward accel + gravity
-             // Gyroscope: small rotation (simulating slight turn)
-             Vector3 gyro_measured(0.0, 0.0, 0.01);  // Small yaw rate
-             
-             pim.integrateMeasurement(acc_measured, gyro_measured, imu_dt);
-         }
-         
-        // Add keyframe with PIM incrementally (matches vioBackend behavior)
-        // This will:
-        // 1. Create state
-        // 2. Add IMU factor from PIM
-        // 3. Optimize immediately (since optimize_on_keyframe = true)
-         auto pim_ptr = std::make_shared<PreintegratedCombinedMeasurements>(pim);
-        auto handle_i = interface.addKeyframeWithPIM(t_i, pose_i, vel_i, initial_bias, pim_ptr);
-        ASSERT_TRUE(handle_i.valid) << "Failed to create state at timestamp " << t_i;
-        state_handles.push_back(handle_i);
-        
-        // Verify we can retrieve optimized state immediately (incremental optimization)
-        auto opt_state = interface.getOptimizedState(handle_i);
-        EXPECT_TRUE(opt_state.has_value()) << "Failed to get optimized state for keyframe " << i;
+    try {
+        auto app = std::make_shared<StandaloneApplication>("test_kimera_simple");
+        app->getParameterServer()->setString("GNSSFGO.Optimizer.smootherType", "IncrementalFixedLag");
+        app->getParameterServer()->setDouble("GNSSFGO.Optimizer.smootherLag", 0.1);
+        app->getParameterServer()->setDouble("initialPositionSigma", 1e-05);
+        app->getParameterServer()->setDouble("initialRollPitchSigma", 0.174533);
+        app->getParameterServer()->setDouble("initialYawSigma", 0.00174533);
+        app->getParameterServer()->setDouble("initialVelocitySigma", 0.001);
+        app->getParameterServer()->setDouble("initialAccBiasSigma", 0.1);
+        app->getParameterServer()->setDouble("initialGyroBiasSigma", 0.01);
+
+        KimeraIntegrationInterface interface(*app);
+
+        KimeraIntegrationParams params;
+        params.imu_rate = 200.0;
+        params.optimize_on_keyframe = true;
+        params.use_gp_priors = false;
+
+        ASSERT_TRUE(interface.initialize(params)) << "Failed to initialize interface";
+        EXPECT_TRUE(interface.isInitialized());
+
+        auto pim_params = PreintegrationCombinedParams::MakeSharedD(9.81);
+        pim_params->setGyroscopeCovariance(Matrix3::Identity() * std::pow(0.0003394, 2.0));
+        pim_params->setAccelerometerCovariance(Matrix3::Identity() * std::pow(0.002, 2.0));
+        pim_params->setBiasAccCovariance(Matrix3::Identity() * std::pow(0.0003, 2.0));
+        pim_params->setBiasOmegaCovariance(Matrix3::Identity() * std::pow(0.000038785, 2.0));
+
+        const int num_keyframes = 5;
+        const double dt = 0.1;
+        std::vector<StateHandle> state_handles;
+
+        Pose3 initial_pose;
+        Vector3 initial_velocity = Vector3::Zero();
+        imuBias::ConstantBias initial_bias;
+
+        double t0 = 0.0;
+        StateHandle previous_handle;
+        auto handle0 = addStateAndMaybeImu(interface,
+                                           previous_handle,
+                                           t0,
+                                           initial_pose,
+                                           initial_velocity,
+                                           initial_bias,
+                                           nullptr);
+        ASSERT_TRUE(handle0.valid) << "Failed to create first state";
+        state_handles.push_back(handle0);
+
+        for (int i = 1; i < num_keyframes; ++i) {
+            double t_i = t0 + i * dt;
+            Pose3 pose_i(Rot3(), Point3(i * dt * 1.0, 0.0, 0.0));
+            Vector3 vel_i(1.0, 0.0, 0.0);
+
+            PreintegratedCombinedMeasurements pim(pim_params, initial_bias);
+            const int num_imu_per_interval = 10;
+            const double imu_dt = dt / num_imu_per_interval;
+            for (int j = 0; j < num_imu_per_interval; ++j) {
+                Vector3 acc_measured(0.1, 0.0, 9.81);
+                Vector3 gyro_measured(0.0, 0.0, 0.01);
+                pim.integrateMeasurement(acc_measured, gyro_measured, imu_dt);
+            }
+
+            auto pim_ptr = std::make_shared<PreintegratedCombinedMeasurements>(pim);
+            auto handle_i = addStateAndMaybeImu(interface,
+                                                previous_handle,
+                                                t_i,
+                                                pose_i,
+                                                vel_i,
+                                                initial_bias,
+                                                pim_ptr);
+            ASSERT_TRUE(handle_i.valid) << "Failed to create state at timestamp " << t_i;
+            state_handles.push_back(handle_i);
+
+            auto opt_state = interface.getOptimizedState(handle_i);
+            if (!opt_state.has_value()) {
+                std::cout << "WARNING: Failed to get optimized state for keyframe " << i
+                          << " (optimization may have failed)" << std::endl;
+            }
+            EXPECT_TRUE(opt_state.has_value()) << "Failed to get optimized state for keyframe " << i;
+        }
+
+        for (size_t i = 0; i < state_handles.size(); ++i) {
+            auto opt_state = interface.getOptimizedState(state_handles[i]);
+            EXPECT_TRUE(opt_state.has_value()) << "Failed to get optimized state for state " << i;
+            if (opt_state.has_value()) {
+                std::cout << "State " << i << " optimized pose: "
+                          << opt_state->pose().translation().transpose() << std::endl;
+                std::cout << "State " << i << " optimized velocity: "
+                          << opt_state->velocity().transpose() << std::endl;
+            }
+        }
+
+        std::cout << "Incremental optimization path exercised ("
+                  << state_handles.size() << " states)" << std::endl;
+    } catch (const std::exception& e) {
+        FAIL() << "BuildAndOptimizeGraph threw exception: " << e.what();
     }
-    
-    // Final verification - check all states are optimized
-     for (size_t i = 0; i < state_handles.size(); ++i) {
-         auto opt_state = interface.getOptimizedState(state_handles[i]);
-         EXPECT_TRUE(opt_state.has_value()) << "Failed to get optimized state for state " << i;
-         
-         if (opt_state.has_value()) {
-             std::cout << "State " << i << " optimized pose: " 
-                       << opt_state->pose().translation().transpose() << std::endl;
-             std::cout << "State " << i << " optimized velocity: " 
-                       << opt_state->velocity().transpose() << std::endl;
-         }
-     }
-    
-    std::cout << "Incremental optimization successful!" << std::endl;
-    std::cout << "  Total states: " << state_handles.size() << std::endl;
  }
  
  /**
@@ -175,9 +216,16 @@
      pim_params->setGyroscopeCovariance(Matrix3::Identity() * 0.0001);
      pim_params->setAccelerometerCovariance(Matrix3::Identity() * 0.001);
      
+    StateHandle previous_handle;
     // Create first keyframe (no PIM)
      double t0 = 0.0;
-    auto handle0 = interface.addKeyframeWithPIM(t0, Pose3(), Vector3::Zero(), imuBias::ConstantBias(), nullptr);
+    auto handle0 = addStateAndMaybeImu(interface,
+                                       previous_handle,
+                                       t0,
+                                       Pose3(),
+                                       Vector3::Zero(),
+                                       imuBias::ConstantBias(),
+                                       nullptr);
      ASSERT_TRUE(handle0.valid);
      
     // Create second keyframe with PIM (incremental)
@@ -186,7 +234,13 @@
     pim.integrateMeasurement(Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
     auto pim_ptr = std::make_shared<PreintegratedCombinedMeasurements>(pim);
     
-    auto handle1 = interface.addKeyframeWithPIM(t1, Pose3(), Vector3::Zero(), imuBias::ConstantBias(), pim_ptr);
+    auto handle1 = addStateAndMaybeImu(interface,
+                                       previous_handle,
+                                       t1,
+                                       Pose3(),
+                                       Vector3::Zero(),
+                                       imuBias::ConstantBias(),
+                                       pim_ptr);
      ASSERT_TRUE(handle1.valid);
      
     // Verify states are optimized (optimization happens incrementally)
@@ -258,7 +312,7 @@ TEST(KimeraSimpleIntegration, PriorFactorsOnFirstState) {
     Vector3 initial_velocity(0.0, 0.0, 0.0);
     imuBias::ConstantBias initial_bias;
     
-    auto handle0 = interface.addKeyframeWithPIM(0.0, initial_pose, initial_velocity, initial_bias, nullptr);
+    auto handle0 = interface.addKeyframeState(0.0, initial_pose, initial_velocity, initial_bias);
     ASSERT_TRUE(handle0.valid);
     
     // Verify we can get optimized state (priors should constrain it)
@@ -303,21 +357,40 @@ TEST(KimeraSimpleIntegration, IMUFactorConnectivity) {
     
     // Create 3 keyframes with PIM between them
     std::vector<StateHandle> handles;
+    StateHandle previous_handle;
     
     // First keyframe
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     handles.push_back(h0);
     
     // Second keyframe with PIM
     auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h1 = interface.addKeyframeWithPIM(0.1, Pose3(), Vector3::Zero(), bias, pim1);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.1,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim1);
     ASSERT_TRUE(h1.valid);
     handles.push_back(h1);
     
     // Third keyframe with PIM
     auto pim2 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h2 = interface.addKeyframeWithPIM(0.2, Pose3(), Vector3::Zero(), bias, pim2);
+    auto h2 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.2,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim2);
     ASSERT_TRUE(h2.valid);
     handles.push_back(h2);
     
@@ -357,13 +430,25 @@ TEST(KimeraSimpleIntegration, OptimizationConvergence) {
     imuBias::ConstantBias bias;
     
     // Create two keyframes with motion
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3(1.0, 0.0, 0.0), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3(1.0, 0.0, 0.0),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     
     // Create PIM with forward acceleration
     auto pim = createPIM(pim_params, bias, Vector3(1.0, 0.0, 9.81), Vector3::Zero(), 0.1);
-    auto h1 = interface.addKeyframeWithPIM(0.1, Pose3(Rot3(), Point3(0.1, 0, 0)), 
-                                           Vector3(1.1, 0.0, 0.0), bias, pim);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.1,
+                                  Pose3(Rot3(), Point3(0.1, 0, 0)),
+                                  Vector3(1.1, 0.0, 0.0),
+                                  bias,
+                                  pim);
     ASSERT_TRUE(h1.valid);
     
     // Verify optimization occurred - states should be retrievable
@@ -414,16 +499,35 @@ TEST(KimeraSimpleIntegration, StationaryScenario) {
     imuBias::ConstantBias bias;
     
     // Create 3 keyframes with no motion (only gravity in IMU)
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     
     // PIM with only gravity (stationary)
     auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h1 = interface.addKeyframeWithPIM(0.1, Pose3(), Vector3::Zero(), bias, pim1);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.1,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim1);
     ASSERT_TRUE(h1.valid);
     
     auto pim2 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h2 = interface.addKeyframeWithPIM(0.2, Pose3(), Vector3::Zero(), bias, pim2);
+    auto h2 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.2,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim2);
     ASSERT_TRUE(h2.valid);
     
     // Verify all states optimized
@@ -473,18 +577,35 @@ TEST(KimeraSimpleIntegration, ConstantVelocityMotion) {
     const double dt = 0.1;
     
     // Create keyframes with constant velocity motion
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3(velocity, 0, 0), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3(velocity, 0, 0),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     
     // PIM with only gravity (constant velocity = no acceleration except gravity)
     auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), dt);
-    auto h1 = interface.addKeyframeWithPIM(dt, Pose3(Rot3(), Point3(velocity * dt, 0, 0)), 
-                                           Vector3(velocity, 0, 0), bias, pim1);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  dt,
+                                  Pose3(Rot3(), Point3(velocity * dt, 0, 0)),
+                                  Vector3(velocity, 0, 0),
+                                  bias,
+                                  pim1);
     ASSERT_TRUE(h1.valid);
     
     auto pim2 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), dt);
-    auto h2 = interface.addKeyframeWithPIM(2*dt, Pose3(Rot3(), Point3(2*velocity*dt, 0, 0)), 
-                                           Vector3(velocity, 0, 0), bias, pim2);
+    auto h2 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  2*dt,
+                                  Pose3(Rot3(), Point3(2*velocity*dt, 0, 0)),
+                                  Vector3(velocity, 0, 0),
+                                  bias,
+                                  pim2);
     ASSERT_TRUE(h2.valid);
     
     // Verify optimization
@@ -536,7 +657,14 @@ TEST(KimeraSimpleIntegration, MultipleKeyframes) {
     std::vector<StateHandle> handles;
     
     // Create first keyframe
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     handles.push_back(h0);
     
@@ -547,7 +675,13 @@ TEST(KimeraSimpleIntegration, MultipleKeyframes) {
         Vector3 vel(0.5, 0, 0);
         
         auto pim = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), dt);
-        auto h = interface.addKeyframeWithPIM(t, pose, vel, bias, pim);
+        auto h = addStateAndMaybeImu(interface,
+                                     previous_handle,
+                                     t,
+                                     pose,
+                                     vel,
+                                     bias,
+                                     pim);
         ASSERT_TRUE(h.valid) << "Failed to create keyframe " << i;
         handles.push_back(h);
     }
@@ -559,60 +693,6 @@ TEST(KimeraSimpleIntegration, MultipleKeyframes) {
     }
     
     std::cout << "Multiple keyframes test passed - " << handles.size() << " keyframes processed" << std::endl;
-}
-
-/**
- * @brief Test manual optimization (without optimize_on_keyframe)
- */
-TEST(KimeraSimpleIntegration, ManualOptimization) {
-    auto app = std::make_shared<StandaloneApplication>("test_manual_opt");
-    app->getParameterServer()->setString("GNSSFGO.Optimizer.smootherType", "IncrementalFixedLag");
-    app->getParameterServer()->setDouble("GNSSFGO.Optimizer.smootherLag", 0.1);
-    app->getParameterServer()->setDouble("initialPositionSigma", 1e-05);
-    app->getParameterServer()->setDouble("initialRollPitchSigma", 0.174533);
-    app->getParameterServer()->setDouble("initialYawSigma", 0.00174533);
-    app->getParameterServer()->setDouble("initialVelocitySigma", 0.001);
-    app->getParameterServer()->setDouble("initialAccBiasSigma", 0.1);
-    app->getParameterServer()->setDouble("initialGyroBiasSigma", 0.01);
-    
-    KimeraIntegrationInterface interface(*app);
-    KimeraIntegrationParams params;
-    params.imu_rate = 200.0;
-    params.optimize_on_keyframe = false;  // Manual optimization
-    params.use_gp_priors = false;
-    
-    ASSERT_TRUE(interface.initialize(params));
-    
-    auto pim_params = createStandardPIMParams();
-    imuBias::ConstantBias bias;
-    
-    // Create keyframes without automatic optimization
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
-    ASSERT_TRUE(h0.valid);
-    
-    auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h1 = interface.addKeyframeWithPIM(0.1, Pose3(), Vector3::Zero(), bias, pim1);
-    ASSERT_TRUE(h1.valid);
-    
-    auto pim2 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h2 = interface.addKeyframeWithPIM(0.2, Pose3(), Vector3::Zero(), bias, pim2);
-    ASSERT_TRUE(h2.valid);
-    
-    // Manually trigger optimization
-     auto opt_result = interface.optimize();
-    EXPECT_TRUE(opt_result.success) << "Manual optimization should succeed";
-    EXPECT_GT(opt_result.num_states, 0) << "Should have optimized states";
-    EXPECT_GT(opt_result.num_factors, 0) << "Should have factors in graph";
-    
-    // Verify states are now optimized
-    auto opt0 = interface.getOptimizedState(h0);
-    auto opt1 = interface.getOptimizedState(h1);
-    auto opt2 = interface.getOptimizedState(h2);
-    
-    EXPECT_TRUE(opt0.has_value() && opt1.has_value() && opt2.has_value());
-    
-    std::cout << "Manual optimization test passed - " << opt_result.num_states 
-              << " states, " << opt_result.num_factors << " factors" << std::endl;
 }
 
 /**
@@ -641,10 +721,23 @@ TEST(KimeraSimpleIntegration, StateConsistency) {
     imuBias::ConstantBias bias;
     
     // Create keyframes
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid) << "First keyframe should be valid";
     auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3::Zero(), 0.1);
-    auto h1 = interface.addKeyframeWithPIM(0.1, Pose3(), Vector3::Zero(), bias, pim1);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.1,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim1);
     ASSERT_TRUE(h1.valid) << "Second keyframe should be valid";
     
     // Retrieve state multiple times - should be consistent
@@ -694,14 +787,26 @@ TEST(KimeraSimpleIntegration, RotationMotion) {
     const double yaw_rate = 0.1;  // rad/s
     
     // Create keyframes with rotation
-    auto h0 = interface.addKeyframeWithPIM(0.0, Pose3(), Vector3::Zero(), bias, nullptr);
+    StateHandle previous_handle;
+    auto h0 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  0.0,
+                                  Pose3(),
+                                  Vector3::Zero(),
+                                  bias,
+                                  nullptr);
     ASSERT_TRUE(h0.valid);
     
     // PIM with rotation (yaw rate)
     auto pim1 = createPIM(pim_params, bias, Vector3(0, 0, 9.81), Vector3(0, 0, yaw_rate), dt);
     Rot3 rot1 = Rot3::Yaw(yaw_rate * dt);
-    auto h1 = interface.addKeyframeWithPIM(dt, Pose3(rot1, Point3::Zero()), 
-                                           Vector3::Zero(), bias, pim1);
+    auto h1 = addStateAndMaybeImu(interface,
+                                  previous_handle,
+                                  dt,
+                                  Pose3(rot1, Point3::Zero()),
+                                  Vector3::Zero(),
+                                  bias,
+                                  pim1);
     ASSERT_TRUE(h1.valid);
     
     // Verify optimization

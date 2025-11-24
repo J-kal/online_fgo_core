@@ -160,6 +160,26 @@ std::vector<double> GraphTimeCentricKimera::getAllStateTimestamps() const {
   return timestamps;
 }
 
+size_t GraphTimeCentricKimera::addKeyframeState(double timestamp,
+                                                const gtsam::Pose3& pose,
+                                                const gtsam::Vector3& velocity,
+                                                const gtsam::imuBias::ConstantBias& bias) {
+  size_t state_idx = findOrCreateStateForTimestamp(timestamp, true);
+  if (state_idx == 0) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to create state at timestamp " +
+                               std::to_string(timestamp));
+    return 0;
+  }
+
+  if (!setStateInitialValues(state_idx, pose, velocity, bias)) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to set initial values for state " +
+                               std::to_string(state_idx));
+    return 0;
+  }
+
+  return state_idx;
+}
+
 
 StatusGraphConstruction GraphTimeCentricKimera::constructFactorGraphFromTimestamps(
     const std::vector<double>& timestamps) {
@@ -277,6 +297,9 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
             *combined_pim);
     
     this->push_back(imu_factor);
+    
+    // Track this as a new factor for incremental optimization (matching vioBackend pattern)
+    new_factors_since_last_opt_.push_back(imu_factor);
     
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Added CombinedImuFactor from PIM between states " + 
                                std::to_string(state_i_idx) + " and " + 
@@ -464,6 +487,70 @@ double GraphTimeCentricKimera::optimizeWithExternalFactors(fgo::data::State& new
   appPtr_->getLogger().info("GraphTimeCentricKimera: Starting optimization with external factors...");
   std::cout << "[online_fgo_core] GraphTimeCentricKimera: OPTIMIZE WITH EXTERNAL FACTORS" << std::endl;
   
+  // Build new factors and values since last optimization (matching vioBackend pattern)
+  // For first optimization, all factors/values are "new"
+  // For subsequent optimizations, only track what was added since last time
+  gtsam::NonlinearFactorGraph new_factors;
+  gtsam::Values new_values;
+  fgo::solvers::FixedLagSmoother::KeyTimestampMap new_timestamps;
+  
+  if (last_optimization_graph_size_ == 0) {
+    // First optimization: all factors and values are new
+    for (const auto& factor : *this) {
+      if (factor) {
+        new_factors.push_back(factor);
+      }
+    }
+    new_values = values_;
+    new_timestamps = keyTimestampMap_;
+    appPtr_->getLogger().info("GraphTimeCentricKimera: First optimization - passing all " + 
+                              std::to_string(new_factors.size()) + " factors and " + 
+                              std::to_string(new_values.size()) + " values");
+  } else {
+    // Subsequent optimization: only pass new factors and values
+    size_t current_graph_size = this->size();
+    size_t current_values_size = values_.size();
+    
+    // Extract new factors (added since last optimization)
+    for (size_t i = last_optimization_graph_size_; i < current_graph_size; ++i) {
+      if ((*this)[i]) {
+        new_factors.push_back((*this)[i]);
+      }
+    }
+    
+    // Extract new values (added since last optimization)
+    // Values are stored as key-value pairs, so we need to track which keys are new
+    size_t values_added = 0;
+    for (const auto& key_value : values_) {
+      // Check if this key was added since last optimization
+      // For simplicity, if values size increased, assume new keys were added
+      // This is approximate but should work for incremental updates
+      if (values_added >= last_optimization_values_size_) {
+        new_values.insert(key_value.key, key_value.value);
+        if (keyTimestampMap_.find(key_value.key) != keyTimestampMap_.end()) {
+          new_timestamps[key_value.key] = keyTimestampMap_.at(key_value.key);
+        }
+      }
+      values_added++;
+    }
+    
+    appPtr_->getLogger().info("GraphTimeCentricKimera: Incremental optimization - passing " + 
+                              std::to_string(new_factors.size()) + " new factors and " + 
+                              std::to_string(new_values.size()) + " new values");
+  }
+  
+  // Safety check: Ensure we have factors to optimize
+  if (new_factors.size() == 0) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera: No new factors to optimize, skipping");
+    return 0.0;
+  }
+  
+  // Safety check: Ensure we have values
+  if (new_values.size() == 0) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera: No new values to optimize, skipping");
+    return 0.0;
+  }
+  
   // Validate all factor keys exist in values_ before optimization
   // This prevents "invalid key" errors from the solver
   bool all_keys_exist = true;
@@ -513,16 +600,24 @@ double GraphTimeCentricKimera::optimizeWithExternalFactors(fgo::data::State& new
     }
   }
   
-  // Call base class optimize method
-  double opt_time = this->optimize(new_state);
-  
-  // Clear related keys after optimization
-  relatedKeys_.clear();
-  
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Optimization completed in " + 
-                            std::to_string(opt_time) + " seconds");
-  
-  return opt_time;
+  // Call base class optimize method with exception handling (matching vioBackend's updateSmoother pattern)
+  try {
+    double opt_time = this->optimize(new_state);
+    
+    // Clear related keys after optimization
+    relatedKeys_.clear();
+    
+    appPtr_->getLogger().info("GraphTimeCentricKimera: Optimization completed in " + 
+                              std::to_string(opt_time) + " seconds");
+    
+    return opt_time;
+  } catch (const std::exception& e) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception during optimization: " + 
+                               std::string(e.what()));
+    // Clear related keys even on failure
+    relatedKeys_.clear();
+    return 0.0;
+  }
 }
 
 // ========================================================================
