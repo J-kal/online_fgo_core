@@ -181,6 +181,37 @@ bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias)
   return state_idx;
 }
 
+size_t GraphTimeCentricKimera::bootstrapInitialState(double timestamp,
+                                                     const gtsam::Pose3& pose,
+                                                     const gtsam::Vector3& velocity,
+                                                     const gtsam::imuBias::ConstantBias& bias) {
+  if (first_state_priors_added_) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera: bootstrapInitialState called twice");
+    return 0;
+  }
+
+  size_t state_idx = findOrCreateStateForTimestamp(timestamp, true);
+  if (state_idx == 0) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: failed to create initial state");
+    return 0;
+  }
+  bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
+  if (!initial_values_set) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: failed to set initial values during bootstrap");
+    return 0;
+  }
+
+  bool priors_added = addPriorFactorsToFirstState(state_idx, timestamp);
+  if (!priors_added) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: failed to add priors during bootstrap");
+    return 0;
+  }
+
+  first_state_priors_added_ = true;
+  appPtr_->getLogger().info("GraphTimeCentricKimera: bootstrap initial state complete");
+  return state_idx;
+}
+
 
 StatusGraphConstruction GraphTimeCentricKimera::constructFactorGraphFromTimestamps(
     const std::vector<double>& timestamps) {
@@ -504,7 +535,6 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
       "graph_size=" + std::to_string(this->size()) +
       " values_size=" + std::to_string(values_.size()) +
       " keyTimestampMap_size=" + std::to_string(keyTimestampMap_.size()) +
-      " last_optimization_graph_size_=" + std::to_string(last_optimization_graph_size_) +
       " first_state_priors_added_=" + std::to_string(first_state_priors_added_));
 
   if (this->size() == 0) {
@@ -513,56 +543,13 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     return false;
   }
 
-  // Bootstrap: provide entire graph
-  // IMPORTANT: Copy factors one by one instead of using iterator range
-  // This matches VioBackend's approach and avoids incomplete type issues
-  if (last_optimization_graph_size_ == 0) {
-    std::cerr << "[FORCE] GraphTimeCentricKimera::buildIncrementalUpdate: BOOTSTRAP CASE - graph_size=" 
-              << this->size() << std::endl;
-    
-    appPtr_->getLogger().info(
-        "GraphTimeCentricKimera::buildIncrementalUpdate: bootstrap optimization (copy entire graph)");
-    
-    // Copy factors one by one (safer than iterator range for derived classes)
-    new_factors->reserve(this->size());
-    std::cerr << "[FORCE] About to copy " << this->size() << " factors" << std::endl;
-    for (size_t i = 0; i < this->size(); ++i) {
-      try {
-        new_factors->push_back(this->at(i));
-        std::cerr << "[FORCE] Copied factor " << i << "/" << this->size() << std::endl;
-      } catch (const std::exception& e) {
-        std::cerr << "[FORCE] ERROR copying factor " << i << ": " << e.what() << std::endl;
-        throw;
-      }
-    }
-    
-    *new_values = values_;
-    *new_timestamps = keyTimestampMap_;
-    
-    std::cerr << "[FORCE] Bootstrap copy complete: new_factors=" << new_factors->size()
-              << " new_values=" << new_values->size()
-              << " new_timestamps=" << new_timestamps->size() << std::endl;
-    
-    appPtr_->getLogger().info(
-        "GraphTimeCentricKimera::buildIncrementalUpdate: bootstrap copy result: "
-        "new_factors_size=" + std::to_string(new_factors->size()) +
-        " new_values_size=" + std::to_string(new_values->size()) +
-        " new_timestamps_size=" + std::to_string(new_timestamps->size()) +
-        " (graph_size=" + std::to_string(this->size()) + ")");
-    return true;
-  }
-
   if (new_factors_since_last_opt_.empty() && new_values_since_last_opt_.empty()) {
     appPtr_->getLogger().info(
         "GraphTimeCentricKimera::buildIncrementalUpdate: no new factors/values since last opt");
     return false;
   }
 
-  // Copy factors one by one (safer than iterator range)
-  new_factors->reserve(new_factors_since_last_opt_.size());
-  for (size_t i = 0; i < new_factors_since_last_opt_.size(); ++i) {
-    new_factors->push_back(new_factors_since_last_opt_.at(i));
-  }
+  *new_factors = new_factors_since_last_opt_;
   *new_values = new_values_since_last_opt_;
 
   for (const auto& [key, timestamp] : new_key_timestamps_since_last_opt_) {
@@ -573,7 +560,6 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
 }
 
 void GraphTimeCentricKimera::finalizeIncrementalUpdate() {
-  last_optimization_graph_size_ = this->size();
   new_factors_since_last_opt_.resize(0);
   new_values_since_last_opt_.clear();
   new_key_timestamps_since_last_opt_.clear();
@@ -763,22 +749,6 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
       }
     }
     
-    // Add prior factors to the first state if not already added
-    // This ensures the system is well-constrained (matching Kimera-VIO approach)
-    if (state_idx == 1 && !first_state_priors_added_) {
-      appPtr_->getLogger().info(
-          "GraphTimeCentricKimera::setStateInitialValues: attempting to add prior "
-          "factors for first state, keyTimestampMap_.count(pose_key)=" +
-          std::to_string(keyTimestampMap_.count(pose_key)));
-      double timestamp = keyTimestampMap_[pose_key];
-      if (addPriorFactorsToFirstState(state_idx, timestamp)) {
-        first_state_priors_added_ = true;
-        appPtr_->getLogger().info("GraphTimeCentricKimera: Added prior factors to first state after setting initial values");
-      } else {
-        appPtr_->getLogger().warn("GraphTimeCentricKimera: Failed to add prior factors to first state");
-      }
-    }
-    
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Set initial values for state " + 
                                std::to_string(state_idx) + 
                                " - pose: [" + std::to_string(pose.translation().x()) + ", " +
@@ -858,12 +828,15 @@ bool GraphTimeCentricKimera::addPriorFactorsToFirstState(size_t state_idx, doubl
     // Create and add prior factors (matching Kimera-VIO's addInitialPriorFactors)
     auto prior_pose = gtsam::PriorFactor<gtsam::Pose3>(pose_key, pose, noise_init_pose);
     this->push_back(prior_pose);
+    new_factors_since_last_opt_.push_back(prior_pose);
     
     auto prior_vel = gtsam::PriorFactor<gtsam::Vector3>(vel_key, velocity, noise_init_vel_prior);
     this->push_back(prior_vel);
+    new_factors_since_last_opt_.push_back(prior_vel);
     
     auto prior_bias = gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(bias_key, bias, imu_bias_prior_noise);
     this->push_back(prior_bias);
+    new_factors_since_last_opt_.push_back(prior_bias);
 
     appPtr_->getLogger().info(
         "GraphTimeCentricKimera::addPriorFactorsToFirstState: added 3 priors, "

@@ -211,6 +211,15 @@ public:
                             const gtsam::Vector3& velocity,
                             const gtsam::imuBias::ConstantBias& bias);
 
+    /**
+     * @brief Initialize graph with the very first state and priors
+     * @return true if bootstrap succeeded
+     */
+    size_t bootstrapInitialState(double timestamp,
+                                 const gtsam::Pose3& pose,
+                                 const gtsam::Vector3& velocity,
+                                 const gtsam::imuBias::ConstantBias& bias);
+
     // ========================================================================
     // IMU MEASUREMENT HANDLING - Buffer and integrate IMU data
     // ========================================================================
@@ -513,7 +522,6 @@ protected:
     gtsam::NonlinearFactorGraph new_factors_since_last_opt_;
     gtsam::Values new_values_since_last_opt_;
     fgo::solvers::FixedLagSmoother::KeyTimestampMap new_key_timestamps_since_last_opt_;
-    size_t last_optimization_graph_size_ = 0;  // Track graph size at last optimization
     
     // Smart factors already in the graph
     LandmarkIdSmartFactorMap old_smart_factors_;

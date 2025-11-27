@@ -222,6 +222,11 @@ namespace fgo::integration {
                                  const gtsam::Vector3& velocity,
                                  const gtsam::imuBias::ConstantBias& bias);
 
+    StateHandle bootstrapInitialState(double timestamp,
+                                      const gtsam::Pose3& pose,
+                                      const gtsam::Vector3& velocity,
+                                      const gtsam::imuBias::ConstantBias& bias);
+
     bool addImuFactorBetween(const StateHandle& previous_state,
                              const StateHandle& current_state,
                              std::shared_ptr<gtsam::PreintegrationType> pim);

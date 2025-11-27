@@ -343,6 +343,37 @@ StateHandle KimeraIntegrationInterface::addKeyframeState(
   }
 }
 
+StateHandle KimeraIntegrationInterface::bootstrapInitialState(
+    double timestamp,
+    const gtsam::Pose3& pose,
+    const gtsam::Vector3& velocity,
+    const gtsam::imuBias::ConstantBias& bias) {
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return StateHandle();
+  }
+
+  app_->getLogger().info("KimeraIntegrationInterface: BOOTSTRAP INITIAL STATE at "
+                         + std::to_string(timestamp));
+
+  try {
+    size_t state_idx = graph_->bootstrapInitialState(timestamp, pose, velocity, bias);
+    if (state_idx == 0) {
+      app_->getLogger().error("KimeraIntegrationInterface: Failed to bootstrap initial state");
+      return StateHandle();
+    }
+
+    StateHandle handle(state_idx, timestamp);
+    last_keyframe_handle_ = handle;
+    bufferedStateTimestamps_.push_back(timestamp);
+    return handle;
+  } catch (const std::exception& e) {
+    app_->getLogger().error("KimeraIntegrationInterface: Exception bootstrapping initial state: "
+                            + std::string(e.what()));
+    return StateHandle();
+  }
+}
+
 bool KimeraIntegrationInterface::addImuFactorBetween(
     const StateHandle& previous_state,
     const StateHandle& current_state,

@@ -16,39 +16,25 @@
 //
 
 #include "online_fgo_core/interface/LoggerInterface.h"
-#include <iostream>
-#include <chrono>
-#include <iomanip>
+#include <glog/logging.h>
 
 namespace fgo::core {
 
   void ConsoleLogger::info(const std::string& message) {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    std::cout << "[INFO] [" << std::put_time(std::localtime(&time), "%H:%M:%S") 
-              << "] " << message << std::endl;
+    LOG(INFO) << message;
   }
 
   void ConsoleLogger::warn(const std::string& message) {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    std::cout << "[WARN] [" << std::put_time(std::localtime(&time), "%H:%M:%S") 
-              << "] " << message << std::endl;
+    LOG(WARNING) << message;
   }
 
   void ConsoleLogger::error(const std::string& message) {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    std::cerr << "[ERROR] [" << std::put_time(std::localtime(&time), "%H:%M:%S") 
-              << "] " << message << std::endl;
+    LOG(ERROR) << message;
   }
 
   void ConsoleLogger::debug(const std::string& message) {
-    if (debug_enabled_) {
-      auto now = std::chrono::system_clock::now();
-      auto time = std::chrono::system_clock::to_time_t(now);
-      std::cout << "[DEBUG] [" << std::put_time(std::localtime(&time), "%H:%M:%S") 
-                << "] " << message << std::endl;
+    if (debug_enabled_ || VLOG_IS_ON(1)) {
+      VLOG(1) << message;
     }
   }
 
