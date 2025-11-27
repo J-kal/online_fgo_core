@@ -379,18 +379,8 @@ bool KimeraIntegrationInterface::addImuFactorBetween(
                           std::to_string(current_state.index));
 
   if (params_.optimize_on_keyframe) {
-    try {
-      fgo::data::State optimized_state;
-      double opt_time = graph_->optimizeWithExternalFactors(optimized_state);
-      app_->getLogger().info("KimeraIntegrationInterface: Incremental optimization completed in " +
-                             std::to_string(opt_time) + " seconds");
-    } catch (const std::exception& e) {
-      app_->getLogger().warn("KimeraIntegrationInterface: Optimization failed after adding IMU factor: " +
-                             std::string(e.what()));
-    }
-  } else if (params_.optimize_on_keyframe) {
-    app_->getLogger().warn("KimeraIntegrationInterface: Optimization temporarily disabled due to known "
-                           "solver issues. Graph construction continues without optimization.");
+    app_->getLogger().info(
+        "KimeraIntegrationInterface: IMU factor added; expect external smoother to consume incremental update");
   }
 
   return true;
@@ -411,186 +401,36 @@ bool KimeraIntegrationInterface::addFactor(const FactorData& factor_data) {
   return false;
 }
 
-// ========================================================================
-// OPTIMIZATION
-// ========================================================================
+bool KimeraIntegrationInterface::buildIncrementalUpdate(
+    KimeraIntegrationInterface::IncrementalUpdatePacket* packet) {
+  
+  app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: ENTERED");
+  
+  if (!initialized_ || !graph_ || !packet) {
+      app_->getLogger().error("KimeraIntegrationInterface::buildIncrementalUpdate: invalid state - initialized=" + 
+                            std::to_string(initialized_) + " graph_=" + (graph_ ? "valid" : "null") + 
+                            " packet=" + (packet ? "valid" : "null"));
+    return false;
+  }
 
-OptimizationResult KimeraIntegrationInterface::optimize() {
-  if (!initialized_) {
-    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
-    OptimizationResult result;
-    result.error_message = "Not initialized";
-    return result;
-  }
+  app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: calling graph_->buildIncrementalUpdate");
   
-  std::cout << "[online_fgo_core] KimeraIntegrationInterface: OPTIMIZE" << std::endl;
+  bool result = graph_->buildIncrementalUpdate(
+      &packet->factors, &packet->values, &packet->key_timestamps);
   
-  OptimizationResult result;
   
-  try {
-    app_->getLogger().info("KimeraIntegrationInterface: Starting optimization...");
-    
-    // Check if we have states to optimize
-    if (bufferedStateTimestamps_.empty()) {
-      app_->getLogger().warn("KimeraIntegrationInterface: No states buffered for optimization");
-      result.error_message = "No states buffered";
-      return result;
-    }
-    
-    // Construct factor graph from buffered timestamps
-    auto status = graph_->constructFactorGraphFromTimestamps(bufferedStateTimestamps_);
-    
-    if (status == fgo::graph::StatusGraphConstruction::FAILED) {
-      app_->getLogger().error("KimeraIntegrationInterface: Factor graph construction failed");
-      result.error_message = "Factor graph construction failed";
-      return result;
-    } else if (status == fgo::graph::StatusGraphConstruction::NO_OPTIMIZATION) {
-        app_->getLogger().warn("KimeraIntegrationInterface: Skipping optimization as per graph construction status.");
-        result.success = true;
-        result.optimization_time_ms = 0;
-        result.num_states = 0;
-        return result;
-    }
-    
-    // Run optimization
-    fgo::data::State optimized_state;
-    double opt_time = graph_->optimizeWithExternalFactors(optimized_state);
-    
-    // Package results
-    result.success = true;
-    result.optimization_time_ms = opt_time * 1000.0;
-    result.num_states = bufferedStateTimestamps_.size();
-    result.num_factors = graph_->size();
-    
-    result.latest_nav_state = optimized_state.state;
-    result.latest_bias = optimized_state.imuBias;
-    result.latest_covariance = optimized_state.poseVar;  // TODO: Combine with vel and bias
-    
-    // Clear buffered timestamps after successful optimization
-    bufferedStateTimestamps_.clear();
-    
-    app_->getLogger().info("KimeraIntegrationInterface: Optimization successful in " + 
-                           std::to_string(opt_time) + " seconds");
-    
-    return result;
-    
-  } catch (const std::exception& e) {
-    app_->getLogger().error("KimeraIntegrationInterface: Exception during optimization: " + 
-                            std::string(e.what()));
-    
-    // Save debug information: factor graph keys, .g2o and .dot files
-    if (graph_) {
-      app_->getLogger().error("KimeraIntegrationInterface: Saving factor graph debug information...");
-      try {
-        // Get the current factor graph and values from the graph object
-        // GraphBase inherits from NonlinearFactorGraph, so we can cast
-        const gtsam::NonlinearFactorGraph& current_graph = *graph_;
-        const gtsam::Values& current_values = graph_->getValues();
-        
-        saveFactorGraphDebugInfo(current_graph, current_values, "online_fgo_exception", app_->getLogger());
-      } catch (const std::exception& debug_e) {
-        app_->getLogger().error("Failed to save debug info: " + std::string(debug_e.what()));
-      }
-    }
-    
-    result.error_message = std::string("Exception: ") + e.what();
-    return result;
-  }
+  
+  app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: result=" + 
+                        std::to_string(result) + " factors=" + std::to_string(packet->factors.size()) +
+                        " values=" + std::to_string(packet->values.size()) +
+                        " key_timestamps=" + std::to_string(packet->key_timestamps.size()));
+  return result;
 }
 
-bool KimeraIntegrationInterface::optimizeAndGetLatestState(gtsam::NavState& nav_state, 
-                                                           gtsam::imuBias::ConstantBias& bias) {
-  OptimizationResult result = optimize();
-  
-  if (result.success) {
-    nav_state = result.latest_nav_state;
-    bias = result.latest_bias;
-    return true;
+void KimeraIntegrationInterface::markIncrementalUpdateConsumed() {
+  if (graph_) {
+    graph_->finalizeIncrementalUpdate();
   }
-  
-  return false;
-}
-
-// ========================================================================
-// RESULT RETRIEVAL
-// ========================================================================
-
-std::optional<gtsam::NavState> KimeraIntegrationInterface::getOptimizedState(StateHandle handle) {
-  if (!initialized_ || !handle.valid) {
-    return std::nullopt;
-  }
-  
-  auto pose = graph_->getOptimizedPose(handle.index);
-  auto velocity = graph_->getOptimizedVelocity(handle.index);
-  
-  if (pose && velocity) {
-    return gtsam::NavState(*pose, *velocity);
-  }
-  
-  return std::nullopt;
-}
-
-std::optional<gtsam::imuBias::ConstantBias> KimeraIntegrationInterface::getOptimizedBias(
-    StateHandle handle) {
-  if (!initialized_ || !handle.valid) {
-    return std::nullopt;
-  }
-  
-  return graph_->getOptimizedBias(handle.index);
-}
-
-std::optional<gtsam::Matrix> KimeraIntegrationInterface::getStateCovariance(StateHandle handle) {
-  if (!initialized_ || !handle.valid) {
-    return std::nullopt;
-  }
-  
-  return graph_->getStateCovariance(handle.index);
-}
-
-std::optional<gtsam::NavState> KimeraIntegrationInterface::getLatestOptimizedState() {
-  if (!initialized_) {
-    return std::nullopt;
-  }
-  
-  auto timestamps = graph_->getAllStateTimestamps();
-  
-  if (timestamps.empty()) {
-    app_->getLogger().warn("KimeraIntegrationInterface: No states available");
-    return std::nullopt;
-  }
-  
-  // Get latest timestamp
-  double latest_ts = timestamps.back();
-  size_t latest_idx = graph_->getStateIndexAtTimestamp(latest_ts);
-  
-  if (latest_idx == 0) {
-    return std::nullopt;
-  }
-  
-  StateHandle handle(latest_idx, latest_ts);
-  return getOptimizedState(handle);
-}
-
-std::optional<gtsam::imuBias::ConstantBias> KimeraIntegrationInterface::getLatestOptimizedBias() {
-  if (!initialized_) {
-    return std::nullopt;
-  }
-  
-  auto timestamps = graph_->getAllStateTimestamps();
-  
-  if (timestamps.empty()) {
-    return std::nullopt;
-  }
-  
-  double latest_ts = timestamps.back();
-  size_t latest_idx = graph_->getStateIndexAtTimestamp(latest_ts);
-  
-  if (latest_idx == 0) {
-    return std::nullopt;
-  }
-  
-  StateHandle handle(latest_idx, latest_ts);
-  return getOptimizedBias(handle);
 }
 
 // ========================================================================

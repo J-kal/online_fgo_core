@@ -25,16 +25,17 @@
 #include <memory>
 #include <vector>
 #include <string>
-#include <optional>
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/base/Matrix.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <Eigen/Dense>
 
 #include "online_fgo_core/graph/GraphTimeCentricKimera.h"
 #include "online_fgo_core/data/DataTypesFGO.h"
+#include "online_fgo_core/solver/FixedLagSmoother.h"
 
 namespace fgo::integration {
 
@@ -82,24 +83,6 @@ namespace fgo::integration {
   };
 
   /**
-   * @brief Result of an optimization operation
-   */
-  struct OptimizationResult {
-    bool success = false;
-    double optimization_time_ms = 0.0;
-    size_t num_states = 0;
-    size_t num_factors = 0;
-    std::string error_message;
-    
-    // Latest optimized state
-    gtsam::NavState latest_nav_state;
-    gtsam::imuBias::ConstantBias latest_bias;
-    gtsam::Matrix latest_covariance;
-    
-    OptimizationResult() = default;
-  };
-
-  /**
    * @brief Factor data for external factor insertion (future use)
    */
   struct FactorData {
@@ -126,6 +109,12 @@ namespace fgo::integration {
    */
   class KimeraIntegrationInterface {
   public:
+    struct IncrementalUpdatePacket {
+      gtsam::NonlinearFactorGraph factors;
+      gtsam::Values values;
+      fgo::solvers::FixedLagSmoother::KeyTimestampMap key_timestamps;
+    };
+
     /**
      * @brief Constructor
      * @param app Application interface for framework-agnostic services
@@ -255,81 +244,12 @@ namespace fgo::integration {
     // OPTIMIZATION
     // ========================================================================
 
-    /**
-     * @brief Trigger graph optimization
-     * 
-     * This will:
-     * 1. Construct factor graph from buffered states/measurements
-     * 2. Run ISAM2/batch optimization
-     * 3. Extract results
-     * 
-     * @return OptimizationResult with success status and optimized state
-     * 
-     * TODO: Call graph_->constructFactorGraphFromTimestamps() with buffered timestamps
-     * TODO: Call graph_->optimizeWithExternalFactors()
-     * TODO: Package results into OptimizationResult
-     */
-    OptimizationResult optimize();
-
-    /**
-     * @brief Optimize and return only the latest state
-     * Convenience method for common use case
-     * @param nav_state Output: latest NavState
-     * @param bias Output: latest IMU bias
-     * @return true if optimization successful
-     * 
-     * TODO: Call optimize() and extract latest state
-     */
-    bool optimizeAndGetLatestState(gtsam::NavState& nav_state, 
-                                    gtsam::imuBias::ConstantBias& bias);
+    bool buildIncrementalUpdate(IncrementalUpdatePacket* packet);
+    void markIncrementalUpdateConsumed();
 
     // ========================================================================
     // RESULT RETRIEVAL
     // ========================================================================
-
-    /**
-     * @brief Get optimized state at specific state handle
-     * @param handle State handle
-     * @return NavState if available
-     * 
-     * TODO: Call graph_->getOptimizedPose() and graph_->getOptimizedVelocity()
-     * TODO: Combine into NavState
-     */
-    std::optional<gtsam::NavState> getOptimizedState(StateHandle handle);
-
-    /**
-     * @brief Get optimized IMU bias at state handle
-     * @param handle State handle
-     * @return IMU bias if available
-     * 
-     * TODO: Call graph_->getOptimizedBias()
-     */
-    std::optional<gtsam::imuBias::ConstantBias> getOptimizedBias(StateHandle handle);
-
-    /**
-     * @brief Get state covariance at state handle
-     * @param handle State handle
-     * @return Covariance matrix if available
-     * 
-     * TODO: Call graph_->getStateCovariance()
-     */
-    std::optional<gtsam::Matrix> getStateCovariance(StateHandle handle);
-
-    /**
-     * @brief Get latest optimized NavState
-     * @return NavState at most recent state
-     * 
-     * TODO: Get latest state index from graph and retrieve state
-     */
-    std::optional<gtsam::NavState> getLatestOptimizedState();
-
-    /**
-     * @brief Get latest optimized IMU bias
-     * @return Bias at most recent state
-     * 
-     * TODO: Get latest state index and retrieve bias
-     */
-    std::optional<gtsam::imuBias::ConstantBias> getLatestOptimizedBias();
 
     // ========================================================================
     // CONFIGURATION
@@ -369,7 +289,7 @@ namespace fgo::integration {
     
     // Initialization flag
     bool initialized_ = false;
-    
+
     // Buffered state timestamps (for batched optimization)
     std::vector<double> bufferedStateTimestamps_;
     

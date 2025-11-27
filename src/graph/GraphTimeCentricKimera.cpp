@@ -170,13 +170,14 @@ size_t GraphTimeCentricKimera::addKeyframeState(double timestamp,
                                std::to_string(timestamp));
     return 0;
   }
-
-  if (!setStateInitialValues(state_idx, pose, velocity, bias)) {
+bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
+  if (! initial_values_set) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to set initial values for state " +
-                               std::to_string(state_idx));
+                              std::to_string(state_idx));
     return 0;
   }
-
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Initial values set for state " +
+                            std::to_string(state_idx));
   return state_idx;
 }
 
@@ -479,244 +480,103 @@ bool GraphTimeCentricKimera::addExternalFactor(
   return true;
 }
 
-// ========================================================================
-// OPTIMIZATION
-// ========================================================================
+bool GraphTimeCentricKimera::buildIncrementalUpdate(
+    gtsam::NonlinearFactorGraph* new_factors,
+    gtsam::Values* new_values,
+    fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps) {
+  
+  if (!new_factors || !new_values || !new_timestamps) {
+    appPtr_->getLogger().warn(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: null output pointers: "
+        "new_factors=" + std::to_string(new_factors != nullptr) +
+        " new_values=" + std::to_string(new_values != nullptr) +
+        " new_timestamps=" + std::to_string(new_timestamps != nullptr));
+    return false;
+  }
 
-double GraphTimeCentricKimera::optimizeWithExternalFactors(fgo::data::State& new_state) {
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Starting optimization with external factors...");
-  std::cout << "[online_fgo_core] GraphTimeCentricKimera: OPTIMIZE WITH EXTERNAL FACTORS" << std::endl;
-  
-  // Build new factors and values since last optimization (matching vioBackend pattern)
-  // For first optimization, all factors/values are "new"
-  // For subsequent optimizations, only track what was added since last time
-  gtsam::NonlinearFactorGraph new_factors;
-  gtsam::Values new_values;
-  fgo::solvers::FixedLagSmoother::KeyTimestampMap new_timestamps;
-  
+  new_factors->resize(0);
+  new_values->clear();
+  new_timestamps->clear();
+
+  // Debug current graph / value state before deciding what to return.
+  appPtr_->getLogger().info(
+      "GraphTimeCentricKimera::buildIncrementalUpdate: "
+      "graph_size=" + std::to_string(this->size()) +
+      " values_size=" + std::to_string(values_.size()) +
+      " keyTimestampMap_size=" + std::to_string(keyTimestampMap_.size()) +
+      " last_optimization_graph_size_=" + std::to_string(last_optimization_graph_size_) +
+      " first_state_priors_added_=" + std::to_string(first_state_priors_added_));
+
+  if (this->size() == 0) {
+    appPtr_->getLogger().warn(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: no factors in graph, returning false");
+    return false;
+  }
+
+  // Bootstrap: provide entire graph
+  // IMPORTANT: Copy factors one by one instead of using iterator range
+  // This matches VioBackend's approach and avoids incomplete type issues
   if (last_optimization_graph_size_ == 0) {
-    // First optimization: all factors and values are new
-    for (const auto& factor : *this) {
-      if (factor) {
-        new_factors.push_back(factor);
-      }
-    }
-    new_values = values_;
-    new_timestamps = keyTimestampMap_;
-    appPtr_->getLogger().info("GraphTimeCentricKimera: First optimization - passing all " + 
-                              std::to_string(new_factors.size()) + " factors and " + 
-                              std::to_string(new_values.size()) + " values");
-  } else {
-    // Subsequent optimization: only pass new factors and values
-    size_t current_graph_size = this->size();
-    size_t current_values_size = values_.size();
+    std::cerr << "[FORCE] GraphTimeCentricKimera::buildIncrementalUpdate: BOOTSTRAP CASE - graph_size=" 
+              << this->size() << std::endl;
     
-    // Extract new factors (added since last optimization)
-    for (size_t i = last_optimization_graph_size_; i < current_graph_size; ++i) {
-      if ((*this)[i]) {
-        new_factors.push_back((*this)[i]);
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: bootstrap optimization (copy entire graph)");
+    
+    // Copy factors one by one (safer than iterator range for derived classes)
+    new_factors->reserve(this->size());
+    std::cerr << "[FORCE] About to copy " << this->size() << " factors" << std::endl;
+    for (size_t i = 0; i < this->size(); ++i) {
+      try {
+        new_factors->push_back(this->at(i));
+        std::cerr << "[FORCE] Copied factor " << i << "/" << this->size() << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "[FORCE] ERROR copying factor " << i << ": " << e.what() << std::endl;
+        throw;
       }
     }
     
-    // Extract new values (added since last optimization)
-    // Values are stored as key-value pairs, so we need to track which keys are new
-    size_t values_added = 0;
-    for (const auto& key_value : values_) {
-      // Check if this key was added since last optimization
-      // For simplicity, if values size increased, assume new keys were added
-      // This is approximate but should work for incremental updates
-      if (values_added >= last_optimization_values_size_) {
-        new_values.insert(key_value.key, key_value.value);
-        if (keyTimestampMap_.find(key_value.key) != keyTimestampMap_.end()) {
-          new_timestamps[key_value.key] = keyTimestampMap_.at(key_value.key);
-        }
-      }
-      values_added++;
-    }
+    *new_values = values_;
+    *new_timestamps = keyTimestampMap_;
     
-    appPtr_->getLogger().info("GraphTimeCentricKimera: Incremental optimization - passing " + 
-                              std::to_string(new_factors.size()) + " new factors and " + 
-                              std::to_string(new_values.size()) + " new values");
-  }
-  
-  // Safety check: Ensure we have factors to optimize
-  if (new_factors.size() == 0) {
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: No new factors to optimize, skipping");
-    return 0.0;
-  }
-  
-  // Safety check: Ensure we have values
-  if (new_values.size() == 0) {
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: No new values to optimize, skipping");
-    return 0.0;
-  }
-  
-  // Validate all factor keys exist in values_ before optimization
-  // This prevents "invalid key" errors from the solver
-  bool all_keys_exist = true;
-  std::vector<gtsam::Key> missing_keys;
-  
-  for (const auto& factor : *this) {
-    if (factor) {
-      for (const auto& key : factor->keys()) {
-        if (!values_.exists(key)) {
-          all_keys_exist = false;
-          missing_keys.push_back(key);
-        }
-      }
-    }
-  }
-  
-  if (!all_keys_exist) {
-    std::ostringstream error_msg;
-    error_msg << "GraphTimeCentricKimera: Missing keys in values_ before optimization: ";
-    for (size_t i = 0; i < missing_keys.size() && i < 10; ++i) {
-      error_msg << gtsam::DefaultKeyFormatter(missing_keys[i]) << " ";
-    }
-    if (missing_keys.size() > 10) {
-      error_msg << "... (and " << (missing_keys.size() - 10) << " more)";
-    }
-    appPtr_->getLogger().error(error_msg.str());
+    std::cerr << "[FORCE] Bootstrap copy complete: new_factors=" << new_factors->size()
+              << " new_values=" << new_values->size()
+              << " new_timestamps=" << new_timestamps->size() << std::endl;
     
-    // Try to add missing keys with default values (this should not happen in normal operation)
-    for (const auto& key : missing_keys) {
-      gtsam::Symbol symbol(key);
-      if (symbol.chr() == 'x') {
-        values_.insert(key, gtsam::Pose3());
-        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing pose key " + 
-                                  gtsam::DefaultKeyFormatter(key) + " with default value");
-      } else if (symbol.chr() == 'v') {
-        // Create actual Vector3 object (not expression type - Vector3::Zero() returns expression)
-        // Use default constructor which initializes to zero
-        gtsam::Vector3 zero_vel(0.0, 0.0, 0.0);
-        values_.insert(key, zero_vel);
-        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing velocity key " + 
-                                  gtsam::DefaultKeyFormatter(key) + " with default value");
-      } else if (symbol.chr() == 'b') {
-        values_.insert(key, gtsam::imuBias::ConstantBias());
-        appPtr_->getLogger().warn("GraphTimeCentricKimera: Added missing bias key " + 
-                                  gtsam::DefaultKeyFormatter(key) + " with default value");
-      }
-    }
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: bootstrap copy result: "
+        "new_factors_size=" + std::to_string(new_factors->size()) +
+        " new_values_size=" + std::to_string(new_values->size()) +
+        " new_timestamps_size=" + std::to_string(new_timestamps->size()) +
+        " (graph_size=" + std::to_string(this->size()) + ")");
+    return true;
   }
-  
-  // Call base class optimize method with exception handling (matching vioBackend's updateSmoother pattern)
-  try {
-    double opt_time = this->optimize(new_state);
-    
-    // Clear related keys after optimization
-    relatedKeys_.clear();
-    
-    appPtr_->getLogger().info("GraphTimeCentricKimera: Optimization completed in " + 
-                              std::to_string(opt_time) + " seconds");
-    
-    return opt_time;
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception during optimization: " + 
-                               std::string(e.what()));
-    // Clear related keys even on failure
-    relatedKeys_.clear();
-    return 0.0;
+
+  if (new_factors_since_last_opt_.empty() && new_values_since_last_opt_.empty()) {
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: no new factors/values since last opt");
+    return false;
   }
+
+  // Copy factors one by one (safer than iterator range)
+  new_factors->reserve(new_factors_since_last_opt_.size());
+  for (size_t i = 0; i < new_factors_since_last_opt_.size(); ++i) {
+    new_factors->push_back(new_factors_since_last_opt_.at(i));
+  }
+  *new_values = new_values_since_last_opt_;
+
+  for (const auto& [key, timestamp] : new_key_timestamps_since_last_opt_) {
+    (*new_timestamps)[key] = timestamp;
+  }
+
+  return true;
 }
 
-// ========================================================================
-// RESULT RETRIEVAL
-// ========================================================================
-
-std::optional<gtsam::Pose3> GraphTimeCentricKimera::getOptimizedPose(size_t state_idx) const {
-  try {
-    gtsam::Values result = solver_->calculateEstimate();
-    gtsam::Key pose_key = X(state_idx);
-    
-    if (result.exists(pose_key)) {
-      return result.at<gtsam::Pose3>(pose_key);
-    }
-    
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: Pose not found for state " + 
-                              std::to_string(state_idx));
-    return std::nullopt;
-    
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception getting optimized pose: " + 
-                               std::string(e.what()));
-    return std::nullopt;
-  }
-}
-
-std::optional<gtsam::Vector3> GraphTimeCentricKimera::getOptimizedVelocity(size_t state_idx) const {
-  try {
-    gtsam::Values result = solver_->calculateEstimate();
-    gtsam::Key vel_key = V(state_idx);
-    
-    if (result.exists(vel_key)) {
-      return result.at<gtsam::Vector3>(vel_key);
-    }
-    
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: Velocity not found for state " + 
-                              std::to_string(state_idx));
-    return std::nullopt;
-    
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception getting optimized velocity: " + 
-                               std::string(e.what()));
-    return std::nullopt;
-  }
-}
-
-std::optional<gtsam::imuBias::ConstantBias> GraphTimeCentricKimera::getOptimizedBias(size_t state_idx) const {
-  try {
-    gtsam::Values result = solver_->calculateEstimate();
-    gtsam::Key bias_key = B(state_idx);
-    
-    if (result.exists(bias_key)) {
-      return result.at<gtsam::imuBias::ConstantBias>(bias_key);
-    }
-    
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: Bias not found for state " + 
-                              std::to_string(state_idx));
-    return std::nullopt;
-    
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception getting optimized bias: " + 
-                               std::string(e.what()));
-    return std::nullopt;
-  }
-}
-
-std::optional<gtsam::Matrix> GraphTimeCentricKimera::getStateCovariance(size_t state_idx) const {
-  try {
-    gtsam::Values result = solver_->calculateEstimate();
-    gtsam::Marginals marginals(*this, result);
-    
-    gtsam::Key pose_key = X(state_idx);
-    gtsam::Key vel_key = V(state_idx);
-    gtsam::Key bias_key = B(state_idx);
-    
-    if (!result.exists(pose_key) || !result.exists(vel_key) || !result.exists(bias_key)) {
-      appPtr_->getLogger().warn("GraphTimeCentricKimera: Not all keys exist for state " + 
-                                std::to_string(state_idx));
-      return std::nullopt;
-    }
-    
-    // Get individual covariances
-    gtsam::Matrix pose_cov = marginals.marginalCovariance(pose_key);
-    gtsam::Matrix vel_cov = marginals.marginalCovariance(vel_key);
-    gtsam::Matrix bias_cov = marginals.marginalCovariance(bias_key);
-    
-    // Combine into 15x15 matrix (6+3+6)
-    gtsam::Matrix combined_cov = gtsam::Matrix::Zero(15, 15);
-    combined_cov.block<6, 6>(0, 0) = pose_cov;
-    combined_cov.block<3, 3>(6, 6) = vel_cov;
-    combined_cov.block<6, 6>(9, 9) = bias_cov;
-    
-    return combined_cov;
-    
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception getting state covariance: " + 
-                               std::string(e.what()));
-    return std::nullopt;
-  }
+void GraphTimeCentricKimera::finalizeIncrementalUpdate() {
+  last_optimization_graph_size_ = this->size();
+  new_factors_since_last_opt_.resize(0);
+  new_values_since_last_opt_.clear();
+  new_key_timestamps_since_last_opt_.clear();
 }
 
 // ========================================================================
@@ -778,9 +638,16 @@ std::map<std::string, size_t> GraphTimeCentricKimera::getLandmarkStatistics() co
 
 bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, double timestamp) {
   try {
+    auto buffer_pair = currentPredictedBuffer_.get_all_time_buffer_pair();
+    appPtr_->getLogger().debug(
+        "GraphTimeCentricKimera::createInitialValuesForState: state_idx=" +
+        std::to_string(state_idx) + " ts=" + std::to_string(timestamp) +
+        " currentPredictedBuffer_size=" +
+        std::to_string(buffer_pair.size()));
+
     // Query predicted state from currentPredictedBuffer_
     auto predicted_state = graph::queryCurrentPredictedState(
-        currentPredictedBuffer_.get_all_time_buffer_pair(), timestamp);
+        buffer_pair, timestamp);
     
     // Create keys
     gtsam::Key pose_key = X(state_idx);
@@ -792,18 +659,24 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
       values_.update(pose_key, predicted_state.state.pose());
     } else {
       values_.insert(pose_key, predicted_state.state.pose());
+      new_values_since_last_opt_.insert(pose_key, predicted_state.state.pose());
+      new_key_timestamps_since_last_opt_[pose_key] = timestamp;
     }
     
     if (values_.exists(vel_key)) {
       values_.update(vel_key, predicted_state.state.velocity());
     } else {
       values_.insert(vel_key, predicted_state.state.velocity());
+      new_values_since_last_opt_.insert(vel_key, predicted_state.state.velocity());
+      new_key_timestamps_since_last_opt_[vel_key] = timestamp;
     }
     
     if (values_.exists(bias_key)) {
       values_.update(bias_key, predicted_state.imuBias);
     } else {
       values_.insert(bias_key, predicted_state.imuBias);
+      new_values_since_last_opt_.insert(bias_key, predicted_state.imuBias);
+      new_key_timestamps_since_last_opt_[bias_key] = timestamp;
     }
     
     // Update keyTimestampMap
@@ -832,8 +705,8 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
           keyTimestampMap_[acc_key] = timestamp;
         }
         */    
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " + 
-                               std::to_string(state_idx) + " at timestamp " + 
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " +
+                               std::to_string(state_idx) + " at timestamp " +
                                std::to_string(timestamp));
     
     return true;
@@ -850,6 +723,10 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
                                                     const gtsam::Vector3& velocity,
                                                     const gtsam::imuBias::ConstantBias& bias) {
   try {
+    appPtr_->getLogger().debug(
+        "GraphTimeCentricKimera::setStateInitialValues: state_idx=" +
+        std::to_string(state_idx));
+
     // Get keys for the state
     gtsam::Key pose_key = X(state_idx);
     gtsam::Key vel_key = V(state_idx);
@@ -860,23 +737,39 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
       values_.update(pose_key, pose);
     } else {
       values_.insert(pose_key, pose);
+      new_values_since_last_opt_.insert(pose_key, pose);
+      if (keyTimestampMap_.find(pose_key) != keyTimestampMap_.end()) {
+        new_key_timestamps_since_last_opt_[pose_key] = keyTimestampMap_[pose_key];
+      }
     }
     
     if (values_.exists(vel_key)) {
       values_.update(vel_key, velocity);
     } else {
       values_.insert(vel_key, velocity);
+      new_values_since_last_opt_.insert(vel_key, velocity);
+      if (keyTimestampMap_.find(vel_key) != keyTimestampMap_.end()) {
+        new_key_timestamps_since_last_opt_[vel_key] = keyTimestampMap_[vel_key];
+      }
     }
     
     if (values_.exists(bias_key)) {
       values_.update(bias_key, bias);
     } else {
       values_.insert(bias_key, bias);
+      new_values_since_last_opt_.insert(bias_key, bias);
+      if (keyTimestampMap_.find(bias_key) != keyTimestampMap_.end()) {
+        new_key_timestamps_since_last_opt_[bias_key] = keyTimestampMap_[bias_key];
+      }
     }
     
     // Add prior factors to the first state if not already added
     // This ensures the system is well-constrained (matching Kimera-VIO approach)
     if (state_idx == 1 && !first_state_priors_added_) {
+      appPtr_->getLogger().info(
+          "GraphTimeCentricKimera::setStateInitialValues: attempting to add prior "
+          "factors for first state, keyTimestampMap_.count(pose_key)=" +
+          std::to_string(keyTimestampMap_.count(pose_key)));
       double timestamp = keyTimestampMap_[pose_key];
       if (addPriorFactorsToFirstState(state_idx, timestamp)) {
         first_state_priors_added_ = true;
@@ -906,6 +799,15 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
 
 bool GraphTimeCentricKimera::addPriorFactorsToFirstState(size_t state_idx, double timestamp) {
   try {
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::addPriorFactorsToFirstState: state_idx=" +
+        std::to_string(state_idx) + " ts=" + std::to_string(timestamp) +
+        " kimera sigmas: pos=" + std::to_string(kimeraParams_.initialPositionSigma) +
+        " rollPitch=" + std::to_string(kimeraParams_.initialRollPitchSigma) +
+        " yaw=" + std::to_string(kimeraParams_.initialYawSigma) +
+        " vel=" + std::to_string(kimeraParams_.initialVelocitySigma) +
+        " accBias=" + std::to_string(kimeraParams_.initialAccBiasSigma) +
+        " gyroBias=" + std::to_string(kimeraParams_.initialGyroBiasSigma));
     // Get the current values for the state
     gtsam::Key pose_key = X(state_idx);
     gtsam::Key vel_key = V(state_idx);
@@ -962,8 +864,14 @@ bool GraphTimeCentricKimera::addPriorFactorsToFirstState(size_t state_idx, doubl
     
     auto prior_bias = gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(bias_key, bias, imu_bias_prior_noise);
     this->push_back(prior_bias);
-    
-    appPtr_->getLogger().info("GraphTimeCentricKimera: Added prior factors to first state " + 
+
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::addPriorFactorsToFirstState: added 3 priors, "
+        "graph_size=" + std::to_string(this->size()) +
+        " values_size=" + std::to_string(values_.size()) +
+        " keyTimestampMap_size=" + std::to_string(keyTimestampMap_.size()));
+
+    appPtr_->getLogger().info("GraphTimeCentricKimera: Added prior factors to first state " +
                               std::to_string(state_idx) + " at timestamp " + 
                               std::to_string(timestamp) + 
                               " (using parameters from BackendParams.yaml)");

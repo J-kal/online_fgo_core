@@ -25,6 +25,7 @@
 #pragma once
 
 #include "online_fgo_core/graph/GraphTimeCentric.h"
+#include "online_fgo_core/solver/FixedLagSmoother.h"
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
@@ -335,48 +336,34 @@ public:
      * TODO: Ensure external factors in relatedKeys_ are handled
      * TODO: Update Kimera-specific state tracking (landmarks, etc.)
      */
-    double optimizeWithExternalFactors(fgo::data::State& new_state);
+    /**
+     * @brief Build incremental update packet without running an internal solver.
+     *
+     * Collects the factors, new values, and timestamps that have been added
+     * since the previous optimization call. The caller is responsible for
+     * feeding this packet into an external smoother (e.g. Kimera's backend).
+     *
+     * @param new_factors Output nonlinear factor graph containing the
+     *        incremental factors.
+     * @param new_values Output values containing only the newly created keys.
+     * @param new_timestamps Output timestamp map for the new keys.
+     * @return true if there is new information to optimize.
+     */
+    bool buildIncrementalUpdate(gtsam::NonlinearFactorGraph* new_factors,
+                                gtsam::Values* new_values,
+                                fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps);
+
+    /**
+     * @brief Mark the current incremental update as consumed.
+     *
+     * Resets the internal tracking state so that subsequent calls to
+     * buildIncrementalUpdate() only include factors/values added afterwards.
+     */
+    void finalizeIncrementalUpdate();
 
     // ========================================================================
     // RESULT RETRIEVAL - Get optimized values and covariances
     // ========================================================================
-
-    /**
-     * @brief Get optimized pose at state index
-     * @param state_idx State index
-     * @return Pose3 if state exists, std::nullopt otherwise
-     * 
-     * TODO: Query from solver_->calculateEstimate() or last result
-     */
-    std::optional<gtsam::Pose3> getOptimizedPose(size_t state_idx) const;
-
-    /**
-     * @brief Get optimized velocity at state index
-     * @param state_idx State index
-     * @return Vector3 if state exists, std::nullopt otherwise
-     * 
-     * TODO: Query from solver result
-     */
-    std::optional<gtsam::Vector3> getOptimizedVelocity(size_t state_idx) const;
-
-    /**
-     * @brief Get optimized IMU bias at state index
-     * @param state_idx State index
-     * @return ConstantBias if state exists, std::nullopt otherwise
-     * 
-     * TODO: Query from solver result
-     */
-    std::optional<gtsam::imuBias::ConstantBias> getOptimizedBias(size_t state_idx) const;
-
-    /**
-     * @brief Get state covariance at state index
-     * @param state_idx State index
-     * @return 15x15 covariance matrix (pose, vel, bias) if available
-     * 
-     * TODO: Use solver_->getMarginals() to extract covariance
-     * TODO: Combine pose, velocity, and bias covariances
-     */
-    std::optional<gtsam::Matrix> getStateCovariance(size_t state_idx) const;
 
     // ========================================================================
     // SMART FACTOR MANAGEMENT (Existing functionality + Future Phase 3)
@@ -525,8 +512,8 @@ protected:
     // These are accumulated between optimizations and passed to solver_->update()
     gtsam::NonlinearFactorGraph new_factors_since_last_opt_;
     gtsam::Values new_values_since_last_opt_;
+    fgo::solvers::FixedLagSmoother::KeyTimestampMap new_key_timestamps_since_last_opt_;
     size_t last_optimization_graph_size_ = 0;  // Track graph size at last optimization
-    size_t last_optimization_values_size_ = 0;  // Track values size at last optimization
     
     // Smart factors already in the graph
     LandmarkIdSmartFactorMap old_smart_factors_;
