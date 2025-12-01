@@ -48,13 +48,18 @@ namespace fgo::integration {
     double smoother_lag = 5.0;  // seconds
     bool use_isam2 = true;
     
-    // IMU parameters
-    double imu_rate = 200.0;  // Hz
-    double accel_noise_sigma = 0.01;
-    double gyro_noise_sigma = 0.01;
-    double accel_bias_rw_sigma = 0.0001;
-    double gyro_bias_rw_sigma = 0.0001;
+    // IMU parameters (mirrors Kimera-VIO ImuParams for consistency)
+    double imu_rate = 200.0;  // Hz (rate_hz from ImuParams.yaml)
+    double accel_noise_sigma = 0.01;   // accelerometer_noise_density
+    double gyro_noise_sigma = 0.01;    // gyroscope_noise_density
+    double accel_bias_rw_sigma = 0.0001;  // accelerometer_random_walk
+    double gyro_bias_rw_sigma = 0.0001;   // gyroscope_random_walk
     Eigen::Vector3d gravity{0.0, 0.0, -9.81};
+    
+    // IMU preintegration type (mirrors Kimera-VIO ImuParams.yaml imu_preintegration_type)
+    // 0 = kPreintegratedCombinedMeasurements (CombinedImuFactor)
+    // 1 = kPreintegratedImuMeasurements (ImuFactor + bias BetweenFactor)
+    int imu_preintegration_type = 0;
     
     // GP prior parameters
     bool use_gp_priors = true;

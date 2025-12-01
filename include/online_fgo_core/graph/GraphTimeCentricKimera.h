@@ -38,6 +38,17 @@
 namespace fgo::graph {
 
 /**
+ * @brief IMU preintegration type (mirrors Kimera-VIO's ImuPreintegrationType)
+ * 
+ * This enum matches Kimera-VIO's ImuPreintegrationType exactly to ensure
+ * consistent behavior between the standard VioBackend and GraphTimeCentric paths.
+ */
+enum class ImuPreintegrationType {
+  kPreintegratedCombinedMeasurements = 0,  // Uses CombinedImuFactor (includes bias evolution)
+  kPreintegratedImuMeasurements = 1        // Uses ImuFactor + separate bias BetweenFactor
+};
+
+/**
  * @brief Parameters specific to Kimera VIO integration
  * 
  * Initialization parameters match Kimera-VIO's BackendParams for consistency
@@ -48,8 +59,13 @@ struct GraphTimeCentricKimeraParams {
   bool createStatesAtIMURate = true;       // Create states at IMU measurement rate
   double imuStateFrequency = 200.0;        // Hz, if creating states at fixed rate
   
-  // IMU factor configuration
-  bool useCombinedIMUFactor = true;        // Use GTSAM CombinedImuFactor
+  // IMU factor configuration (mirrors Kimera-VIO ImuParams)
+  // Type of IMU preintegration: 0 = CombinedImuFactor, 1 = ImuFactor
+  ImuPreintegrationType imuPreintegrationType = ImuPreintegrationType::kPreintegratedCombinedMeasurements;
+  // Parameters for IMU factor (from ImuParams.yaml)
+  double accRandomWalk = 0.0;              // [ m / s^3 / sqrt(Hz) ] accelerometer_random_walk
+  double gyroRandomWalk = 0.0;             // [ rad / s^2 / sqrt(Hz) ] gyroscope_random_walk
+  double nominalSamplingTimeS = 0.005;     // 1/rate_hz from ImuParams.yaml (default 200Hz)
   
   // GP motion prior configuration  
   bool addGPMotionPriors = true;           // Add GP priors between states

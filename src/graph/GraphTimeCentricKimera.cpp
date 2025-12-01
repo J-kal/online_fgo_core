@@ -22,6 +22,8 @@
 #include "online_fgo_core/graph/GraphUtils.h"
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/inference/Key.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/slam/BetweenFactor.h>
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -51,8 +53,9 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
     kimeraParams_.createStatesAtIMURate = params.getBool("kimera.create_states_at_imu_rate", true);
     kimeraParams_.imuStateFrequency = params.getDouble("kimera.imu_state_frequency", 200.0);
     
-    // IMU factor configuration
-    kimeraParams_.useCombinedIMUFactor = params.getBool("kimera.use_combined_imu_factor", true);
+    // NOTE: IMU factor configuration (imuPreintegrationType, accRandomWalk, gyroRandomWalk, 
+    // nominalSamplingTimeS) is set via setKimeraParams() from Kimera's ImuParams.yaml,
+    // NOT from this params file. Do not override them here.
     
     // GP prior configuration
     kimeraParams_.addGPMotionPriors = params.getBool("kimera.add_gp_motion_priors", true);
@@ -72,7 +75,9 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
     
     appPtr_->getLogger().info("GraphTimeCentricKimera: Kimera support initialized successfully");
     appPtr_->getLogger().info("  - Timestamp tolerance: " + std::to_string(kimeraParams_.timestampMatchTolerance) + " s");
-    appPtr_->getLogger().info("  - Use combined IMU factor: " + std::string(kimeraParams_.useCombinedIMUFactor ? "true" : "false"));
+    appPtr_->getLogger().info("  - IMU preintegration type: " + 
+        std::to_string(static_cast<int>(kimeraParams_.imuPreintegrationType)) + 
+        " (0=Combined, 1=Regular+BiasFactor)");
     // appPtr_->getLogger().info("  - Add GP motion priors: " + std::string(kimeraParams_.addGPMotionPriors ? "true" : "false"));
     appPtr_->getLogger().info("  - Add GP motion priors: DISABLED (commented out for IMU isolation testing)");
     appPtr_->getLogger().info("  - Initial position sigma: " + std::to_string(kimeraParams_.initialPositionSigma) + " m");
@@ -346,45 +351,91 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
     size_t state_j_idx,
     const gtsam::PreintegrationType& pim) {
   
-  try {
-    // Get keys for states
-    gtsam::Key pose_i = X(state_i_idx);
-    gtsam::Key vel_i = V(state_i_idx);
-    gtsam::Key bias_i = B(state_i_idx);
-    gtsam::Key pose_j = X(state_j_idx);
-    gtsam::Key vel_j = V(state_j_idx);
-    gtsam::Key bias_j = B(state_j_idx);
-    
-    // Create CombinedImuFactor from PIM (only CombinedMeasurements supported)
-    const auto* combined_pim = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements*>(&pim);
-    if (!combined_pim) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: PIM must be PreintegratedCombinedMeasurements");
+  // Get keys for states (matches VioBackend::addImuFactor structure)
+  gtsam::Key pose_i = X(state_i_idx);
+  gtsam::Key vel_i = V(state_i_idx);
+  gtsam::Key bias_i = B(state_i_idx);
+  gtsam::Key pose_j = X(state_j_idx);
+  gtsam::Key vel_j = V(state_j_idx);
+  gtsam::Key bias_j = B(state_j_idx);
+  
+  // Switch on IMU preintegration type (mirrors VioBackend::addImuFactor exactly)
+  switch (kimeraParams_.imuPreintegrationType) {
+    case ImuPreintegrationType::kPreintegratedCombinedMeasurements: {
+      // CombinedImuFactor includes bias evolution internally
+      const auto* combined_pim = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements*>(&pim);
+      if (!combined_pim) {
+        appPtr_->getLogger().error("GraphTimeCentricKimera: Expected PreintegratedCombinedMeasurements but got different type");
+        return false;
+      }
+      
+      auto imu_factor = boost::make_shared<gtsam::CombinedImuFactor>(
+          pose_i, vel_i,
+          pose_j, vel_j,
+          bias_i, bias_j,
+          *combined_pim);
+      
+      this->push_back(imu_factor);
+      new_factors_since_last_opt_.push_back(imu_factor);
+      
+      appPtr_->getLogger().debug("GraphTimeCentricKimera: Added CombinedImuFactor between states " + 
+                                 std::to_string(state_i_idx) + " and " + std::to_string(state_j_idx));
+      break;
+    }
+    case ImuPreintegrationType::kPreintegratedImuMeasurements: {
+      // ImuFactor + separate BetweenFactor for bias evolution (matches VioBackend exactly)
+      const auto* regular_pim = dynamic_cast<const gtsam::PreintegratedImuMeasurements*>(&pim);
+      if (!regular_pim) {
+        appPtr_->getLogger().error("GraphTimeCentricKimera: Expected PreintegratedImuMeasurements but got different type");
+        return false;
+      }
+      
+      // Create ImuFactor (uses only bias_i, not bias_j)
+      auto imu_factor = boost::make_shared<gtsam::ImuFactor>(
+          pose_i, vel_i,
+          pose_j, vel_j,
+          bias_i,
+          *regular_pim);
+      
+      this->push_back(imu_factor);
+      new_factors_since_last_opt_.push_back(imu_factor);
+      
+      // Add bias evolution factor (matches VioBackend::addImuFactor exactly)
+      // See Trawny05 http://mars.cs.umn.edu/tr/reports/Trawny05b.pdf Eq. 130
+      static const gtsam::imuBias::ConstantBias zero_bias(
+          gtsam::Vector3(0.0, 0.0, 0.0), gtsam::Vector3(0.0, 0.0, 0.0));
+      
+      if (kimeraParams_.nominalSamplingTimeS == 0.0) {
+        appPtr_->getLogger().error("GraphTimeCentricKimera: nominalSamplingTimeS cannot be 0");
+        return false;
+      }
+      
+      const double sqrt_delta_t_ij = std::sqrt(pim.deltaTij());
+      gtsam::Vector6 bias_sigmas;
+      bias_sigmas.head<3>().setConstant(sqrt_delta_t_ij * kimeraParams_.accRandomWalk);
+      bias_sigmas.tail<3>().setConstant(sqrt_delta_t_ij * kimeraParams_.gyroRandomWalk);
+      
+      const gtsam::SharedNoiseModel bias_noise_model =
+          gtsam::noiseModel::Diagonal::Sigmas(bias_sigmas);
+      
+      auto bias_between_factor =
+          boost::make_shared<gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>>(
+              bias_i, bias_j, zero_bias, bias_noise_model);
+      
+      this->push_back(bias_between_factor);
+      new_factors_since_last_opt_.push_back(bias_between_factor);
+      
+      appPtr_->getLogger().debug("GraphTimeCentricKimera: Added ImuFactor + BiasBetweenFactor between states " + 
+                                 std::to_string(state_i_idx) + " and " + std::to_string(state_j_idx));
+      break;
+    }
+    default: {
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Unknown IMU Preintegration Type");
       return false;
     }
-    
-    boost::shared_ptr<gtsam::CombinedImuFactor> imu_factor =
-        boost::make_shared<gtsam::CombinedImuFactor>(
-            pose_i, vel_i,
-            pose_j, vel_j,
-            bias_i, bias_j,
-            *combined_pim);
-    
-    this->push_back(imu_factor);
-    
-    // Track this as a new factor for incremental optimization (matching vioBackend pattern)
-    new_factors_since_last_opt_.push_back(imu_factor);
-    
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added CombinedImuFactor from PIM between states " + 
-                               std::to_string(state_i_idx) + " and " + 
-                               std::to_string(state_j_idx));
-    
-    return true;
-    
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception while adding IMU factor from PIM: " + 
-                               std::string(e.what()));
-    return false;
   }
+  
+  return true;
 }
 
 bool GraphTimeCentricKimera::addPreintegratedIMUData(

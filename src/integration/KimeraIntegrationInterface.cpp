@@ -140,15 +140,27 @@ bool KimeraIntegrationInterface::initialize(const KimeraIntegrationParams& param
       return false;
     }
     
-    // Set Kimera-specific parameters
+    // Set Kimera-specific parameters (mirrors ImuParams structure from Kimera-VIO)
     fgo::graph::GraphTimeCentricKimeraParams kimera_params;
     kimera_params.timestampMatchTolerance = 0.001;
     kimera_params.createStatesAtIMURate = true;
     kimera_params.imuStateFrequency = params.imu_rate;
-    kimera_params.useCombinedIMUFactor = true;
+    
+    // IMU factor configuration (pass through from ImuParams.yaml via adapter)
+    // Convert int to enum type (mirrors VioBackend's use of imu_params_.imu_preintegration_type_)
+    kimera_params.imuPreintegrationType = 
+        static_cast<fgo::graph::ImuPreintegrationType>(params.imu_preintegration_type);
+    kimera_params.accRandomWalk = params.accel_bias_rw_sigma;   // accelerometer_random_walk
+    kimera_params.gyroRandomWalk = params.gyro_bias_rw_sigma;   // gyroscope_random_walk
+    kimera_params.nominalSamplingTimeS = 1.0 / params.imu_rate; // 1/rate_hz
+    
     // kimera_params.addGPMotionPriors = params.use_gp_priors;  // COMMENTED OUT FOR IMU ISOLATION TESTING
     kimera_params.addGPMotionPriors = false;  // Disabled for IMU testing
     kimera_params.optimizeOnKeyframe = params.optimize_on_keyframe;
+    
+    app_->getLogger().info("KimeraIntegrationInterface: IMU preintegration type = " + 
+                           std::to_string(params.imu_preintegration_type) +
+                           " (0=Combined, 1=Regular+BiasFactor)");
     
     graph_->setKimeraParams(kimera_params);
     
