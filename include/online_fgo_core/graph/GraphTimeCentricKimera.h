@@ -693,6 +693,15 @@ public:
                                const gtsam::Pose3& pose,
                                const gtsam::Vector3& velocity,
                                const gtsam::imuBias::ConstantBias& bias);
+    
+    /**
+     * @brief Get the current full factor graph and values for debug logging
+     * @param[out] graph Full current factor graph
+     * @param[out] values Full current values
+     * @return true if successful
+     */
+    bool getCurrentGraphAndValues(gtsam::NonlinearFactorGraph& graph,
+                                  gtsam::Values& values) const;
 
 protected:
     // ========================================================================

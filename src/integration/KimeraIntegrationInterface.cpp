@@ -24,10 +24,43 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <sys/stat.h>   // for mkdir, stat, S_ISDIR
+#include <sys/types.h> // for stat
+#include <limits.h>    // for PATH_MAX
+#include <stdlib.h>    // for realpath
+#include <unistd.h>    // for getcwd
 
 namespace fgo::integration {
+
+// Helper function to create directory recursively
+static bool createDirectoryRecursive(const std::string& path) {
+  if (path.empty()) {
+    return false;
+  }
+  
+  // Check if directory already exists
+  struct stat info;
+  if (stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+    return true;  // Directory already exists
+  }
+  
+  // Try to create the directory
+  if (mkdir(path.c_str(), 0755) == 0) {
+    return true;  // Successfully created
+  }
+  
+  // If mkdir failed, try creating parent directories first
+  size_t last_slash = path.find_last_of('/');
+  if (last_slash != std::string::npos && last_slash > 0) {
+    std::string parent = path.substr(0, last_slash);
+    if (createDirectoryRecursive(parent)) {
+      // Parent created, try again
+      return mkdir(path.c_str(), 0755) == 0;
+    }
+  }
+  
+  return false;
+}
 
 // Helper function to save factor graph debug information
 static void saveFactorGraphDebugInfo(
@@ -543,6 +576,116 @@ bool KimeraIntegrationInterface::addGPMotionPrior(
                           std::to_string(current_state.index));
 
   return true;
+}
+
+bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration, 
+                                                          const std::string& context,
+                                                          const std::string& save_dir) {
+  if (!initialized_ || !graph_) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Cannot save factor graph - not initialized");
+    return false;
+  }
+  
+  try {
+    // Get current graph and values
+    gtsam::NonlinearFactorGraph current_graph;
+    gtsam::Values current_values;
+    
+    if (!graph_->getCurrentGraphAndValues(current_graph, current_values)) {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to get current graph and values");
+      return false;
+    }
+    
+    // Create save directory recursively if it doesn't exist
+    if (!createDirectoryRecursive(save_dir)) {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to create directory: " + save_dir + 
+                             " (files may not be saved)");
+      // Try to continue - maybe directory already exists
+    }
+    
+    // Generate filename with iteration number
+    std::ostringstream filename_ss;
+    filename_ss << save_dir << "/factor_graph_" << context << "_iter" << iteration;
+    std::string prefix = filename_ss.str();
+    
+    // Save .g2o file (standard factor graph format)
+    std::string g2o_filename = prefix + ".g2o";
+    
+    // Get absolute path for logging (helps debug where files actually go)
+    char abs_path[PATH_MAX];
+    char* resolved = realpath(save_dir.c_str(), abs_path);
+    std::string abs_dir = (resolved != nullptr) ? std::string(abs_path) : save_dir;
+    
+    // Get current working directory for debugging
+    char cwd[PATH_MAX];
+    std::string current_dir = (getcwd(cwd, sizeof(cwd)) != nullptr) ? std::string(cwd) : "unknown";
+    
+    try {
+      current_graph.saveGraph(g2o_filename, current_values);
+      
+      // Verify file was actually created
+      struct stat file_info;
+      bool file_exists = (stat(g2o_filename.c_str(), &file_info) == 0);
+      
+      app_->getLogger().info("KimeraIntegrationInterface: Saved factor graph to " + g2o_filename + 
+                             " (factors=" + std::to_string(current_graph.size()) + 
+                             ", values=" + std::to_string(current_values.size()) + 
+                             ", dir=" + save_dir + ", abs_dir=" + abs_dir + 
+                             ", cwd=" + current_dir + ", file_exists=" + (file_exists ? "yes" : "no") + ")");
+      
+      if (!file_exists) {
+        app_->getLogger().error("KimeraIntegrationInterface: File was not created! Check permissions and path.");
+        return false;
+      }
+    } catch (const std::exception& e) {
+      app_->getLogger().error("KimeraIntegrationInterface: Failed to save .g2o file: " + 
+                              std::string(e.what()) + " (path=" + g2o_filename + ", cwd=" + current_dir + ")");
+      return false;
+    }
+    
+    // Save .dot file (GraphViz visualization format)
+    std::string dot_filename = prefix + ".dot";
+    std::ofstream dot_file(dot_filename);
+    if (dot_file.is_open()) {
+      dot_file << "digraph G {" << '\n';
+      dot_file << "  // Factor Graph Visualization" << '\n';
+      dot_file << "  // Context: " << context << '\n';
+      dot_file << "  // Iteration: " << iteration << '\n';
+      dot_file << "  // Total factors: " << current_graph.size() << '\n';
+      dot_file << "  // Total values: " << current_values.size() << '\n';
+      
+      // Add nodes for values
+      for (const auto& key_value : current_values) {
+        dot_file << "  " << gtsam::DefaultKeyFormatter(key_value.key) 
+                << " [shape=box];" << '\n';
+      }
+      
+      // Add edges for factors
+      for (size_t i = 0; i < current_graph.size(); ++i) {
+        if (current_graph[i] && current_graph[i]->size() > 1) {
+          auto keys = current_graph[i]->keys();
+          for (size_t j = 1; j < keys.size(); ++j) {
+            dot_file << "  " << gtsam::DefaultKeyFormatter(keys[0]) 
+                    << " -> " << gtsam::DefaultKeyFormatter(keys[j])
+                    << " [label=\"F" << i << "\"];" << '\n';
+          }
+        }
+      }
+      
+      dot_file << "}" << '\n';
+      dot_file.close();
+      app_->getLogger().info("KimeraIntegrationInterface: Saved factor graph visualization to " + dot_filename);
+    } else {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to open .dot file for writing");
+    }
+    
+    return true;
+    
+  } catch (const std::exception& e) {
+    app_->getLogger().error("KimeraIntegrationInterface: Failed to save factor graph debug info: " + 
+                            std::string(e.what()));
+    return false;
+  }
 }
 
 // ========================================================================

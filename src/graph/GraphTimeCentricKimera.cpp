@@ -1370,5 +1370,23 @@ void GraphTimeCentricKimera::updateSmartFactorSlots(
   }
 }
 
+bool GraphTimeCentricKimera::getCurrentGraphAndValues(
+    gtsam::NonlinearFactorGraph& graph,
+    gtsam::Values& values) const {
+  
+  // Copy the full factor graph (GraphTimeCentricKimera inherits from GraphBase which has the graph)
+  graph.resize(0);
+  for (size_t i = 0; i < this->size(); ++i) {
+    if ((*this)[i]) {
+      graph.push_back((*this)[i]);
+    }
+  }
+  
+  // Copy the full values
+  values = values_;
+  
+  return true;
+}
+
 } // namespace fgo::graph
 

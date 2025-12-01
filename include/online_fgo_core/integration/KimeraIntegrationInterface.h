@@ -442,6 +442,20 @@ struct OmegaAtState {
                           double dt,
                           const OmegaAtState& omega_from,
                           const OmegaAtState& omega_to);
+    
+    /**
+     * @brief Save factor graph debug info after optimization
+     * @param iteration Iteration number (for filename)
+     * @param context Context label (e.g., "after_optimization")
+     * @param save_dir Directory to save files (default: "debug_run_logs")
+     * @return True if saved successfully
+     * 
+     * Saves the current factor graph and values to .g2o and .dot files
+     * in the specified directory for offline analysis.
+     */
+    bool saveFactorGraphDebugInfo(int iteration, 
+                                  const std::string& context = "optimization",
+                                  const std::string& save_dir = "debug_run_logs");
 
     // ========================================================================
     // VISUAL FACTOR INTERFACE
