@@ -39,7 +39,15 @@
 #include <map>
 #include <unordered_map>
 
+// Forward declaration for OmegaAtState from integration interface
+namespace fgo::integration {
+  struct OmegaAtState;
+}
+
 namespace fgo::graph {
+
+// Import OmegaAtState from the integration namespace
+using fgo::integration::OmegaAtState;
 
 /**
  * @brief IMU preintegration type (mirrors Kimera-VIO's ImuPreintegrationType)
@@ -71,8 +79,14 @@ struct GraphTimeCentricKimeraParams {
   double gyroRandomWalk = 0.0;             // [ rad / s^2 / sqrt(Hz) ] gyroscope_random_walk
   double nominalSamplingTimeS = 0.005;     // 1/rate_hz from ImuParams.yaml (default 200Hz)
   
-  // GP motion prior configuration  
-  bool addGPMotionPriors = true;           // Add GP priors between states
+  // GP Motion prior configuration
+  // Adds smoothness constraints on trajectory using Gaussian Process priors
+  // The Qc noise model is passed separately via setGPPriorParams (following visual factors pattern)
+  bool addGPMotionPriors = false;          // Enable GP motion priors between consecutive states
+  
+  // GP model type (from fgo::data::GPModelType enum)
+  // 0=WNOA, 1=WNOJ, 2=WNOJFull, 3=Singer, 4=SingerFull
+  fgo::data::GPModelType gpType = fgo::data::GPModelType::WNOA;
   
   // Visual factor configuration
   bool enableSmartFactors = true;          // Enable smart factor management
@@ -317,6 +331,26 @@ public:
         size_t state_i_idx,
         size_t state_j_idx,
         const gtsam::PreintegrationType& pim);
+    
+    /**
+     * @brief Add GP motion prior factor between two states (SEPARATE from IMU)
+     * 
+     * Creates GP motion prior factors (GPWNOAPrior, GPWNOJPrior, GPSingerPrior, or combinations)
+     * based on kimeraParams_.gpType. This is completely decoupled from IMU factor addition.
+     * 
+     * @param state_i_idx Index of state i (previous keyframe)
+     * @param state_j_idx Index of state j (current keyframe)  
+     * @param dt Time delta between states (seconds)
+     * @param omega_i OmegaAtState for state i (angular velocity + optional acceleration)
+     * @param omega_j OmegaAtState for state j (angular velocity + optional acceleration)
+     * @return true if GP prior added successfully
+     */
+    bool addGPMotionPrior(
+        size_t state_i_idx,
+        size_t state_j_idx,
+        double dt,
+        const OmegaAtState& omega_i,
+        const OmegaAtState& omega_j);
 
     /**
      * @brief Add preintegrated IMU data for later factor creation
@@ -535,6 +569,31 @@ public:
                               const gtsam::Pose3& B_Pose_leftCam,
                               const gtsam::SharedNoiseModel& smart_noise,
                               const gtsam::SmartProjectionParams& smart_params);
+    
+    /**
+     * @brief Set GP motion prior parameters
+     * @param gp_qc_model Pre-initialized Qc noise model for GP priors
+     * @param gp_ad_matrix Singer model acceleration damping matrix
+     * @param gp_acc_prior_noise Prior noise for acceleration state (Full variants)
+     * 
+     * This follows the same pattern as setStereoCalibration - VioBackend creates
+     * all parameters and passes them pre-initialized to ensure consistency.
+     */
+    void setGPPriorParams(const gtsam::SharedNoiseModel& gp_qc_model,
+                          const gtsam::Matrix6& gp_ad_matrix,
+                          const gtsam::SharedNoiseModel& gp_acc_prior_noise);
+    
+    /**
+     * @brief Set angular velocity (omega) for a state
+     * Used for full GP motion priors (WNOJ, WNOJFull, Singer, etc.)
+     * @param state_id State/frame ID
+     * @param omega_state OmegaAtState containing bias-corrected angular velocity
+     * @return True if successful
+     * 
+     * OmegaAtState encapsulates: omega = gyro_meas - gyro_bias
+     * This enables full GP motion priors that constrain both translation and rotation
+     */
+    bool setOmegaForState(size_t state_id, const OmegaAtState& omega_state);
 
     /**
      * @brief Add stereo measurements to feature tracks and update factors
@@ -650,6 +709,11 @@ protected:
     // PIM[i] is preintegration from keyframe[i-1] to keyframe[i]
     // Stored as (timestamp, PIM) pairs where timestamp is the destination keyframe
     std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>> stored_pims_;
+    
+    // Angular velocity (omega) for each state, indexed by state_id
+    // Used for full GP motion priors (WNOJ, WNOJFull, Singer, etc.)
+    // OmegaAtState encapsulates: omega = gyro_measurement - gyro_bias
+    std::map<size_t, OmegaAtState> state_omega_;
 
     // Track if prior factors have been added to the first state
     bool first_state_priors_added_ = false;
@@ -678,9 +742,15 @@ protected:
     gtsam::Cal3_S2Stereo::shared_ptr stereo_cal_;
     gtsam::Pose3 B_Pose_leftCam_;  // Body to left camera transformation
     
-    // Smart factor parameters (initialized from kimeraParams_)
+    // Smart factor parameters (initialized via setStereoCalibration from VioBackend)
     gtsam::SharedNoiseModel smart_noise_;
     gtsam::SmartProjectionParams smart_stereo_params_;  // SmartStereoProjectionParams is alias for SmartProjectionParams
+    
+    // GP motion prior parameters (initialized via setGPPriorParams from VioBackend)
+    gtsam::SharedNoiseModel gp_qc_model_;           // Qc noise model (all GP types)
+    gtsam::Matrix6 gp_ad_matrix_;                    // Singer model acceleration damping
+    gtsam::SharedNoiseModel gp_acc_prior_noise_;     // Acceleration prior (Full variants)
+    bool gp_params_initialized_ = false;
     
     // Landmark counter for generating internal IDs
     std::atomic<uint64_t> landmark_count_{0};

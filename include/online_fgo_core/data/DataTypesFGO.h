@@ -45,11 +45,14 @@ namespace fgo::data {
   };
 
   enum GPModelType {
-    WNOA,
-    WNOJ,
-    WNOJFull,
-    Singer,
-    SingerFull,
+    WNOA,           // 0: White Noise on Acceleration
+    WNOJ,           // 1: White Noise on Jerk
+    WNOJFull,       // 2: WNOJ with acceleration as optimized state
+    Singer,         // 3: Exponentially decaying acceleration
+    SingerFull,     // 4: Singer with acceleration as optimized state
+    WNOA_WNOJ,      // 5: Both WNOA and WNOJ simultaneously
+    WNOA_Singer,    // 6: WNOA + Singer (decay + white noise)
+    WNOA_WNOJ_Singer, // 7: All three non-full models (maximum smoothing)
   };
 
   struct Pose {

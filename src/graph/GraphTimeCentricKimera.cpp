@@ -20,6 +20,10 @@
 
 #include "online_fgo_core/graph/GraphTimeCentricKimera.h"
 #include "online_fgo_core/graph/GraphUtils.h"
+#include "online_fgo_core/factor/motion/GPWNOAPrior.h"   // For WNOA GP motion priors
+#include "online_fgo_core/factor/motion/GPWNOJPrior.h"   // For WNOJ GP motion priors
+#include "online_fgo_core/factor/motion/GPSingerPrior.h" // For Singer GP motion priors
+#include "online_fgo_core/integration/KimeraIntegrationInterface.h"  // For OmegaAtState
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/inference/Key.h>
 #include <gtsam/navigation/ImuFactor.h>
@@ -79,8 +83,21 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
     appPtr_->getLogger().info("  - IMU preintegration type: " + 
         std::to_string(static_cast<int>(kimeraParams_.imuPreintegrationType)) + 
         " (0=Combined, 1=Regular+BiasFactor)");
-    // appPtr_->getLogger().info("  - Add GP motion priors: " + std::string(kimeraParams_.addGPMotionPriors ? "true" : "false"));
-    appPtr_->getLogger().info("  - Add GP motion priors: DISABLED (commented out for IMU isolation testing)");
+    std::string gp_type_str;
+    switch (kimeraParams_.gpType) {
+      case fgo::data::GPModelType::WNOA: gp_type_str = "WNOA"; break;
+      case fgo::data::GPModelType::WNOJ: gp_type_str = "WNOJ"; break;
+      case fgo::data::GPModelType::WNOJFull: gp_type_str = "WNOJFull"; break;
+      case fgo::data::GPModelType::Singer: gp_type_str = "Singer"; break;
+      case fgo::data::GPModelType::SingerFull: gp_type_str = "SingerFull"; break;
+      case fgo::data::GPModelType::WNOA_WNOJ: gp_type_str = "WNOA+WNOJ"; break;
+      case fgo::data::GPModelType::WNOA_Singer: gp_type_str = "WNOA+Singer"; break;
+      case fgo::data::GPModelType::WNOA_WNOJ_Singer: gp_type_str = "WNOA+WNOJ+Singer"; break;
+      default: gp_type_str = "Unknown"; break;
+    }
+    appPtr_->getLogger().info("  - GP motion priors: " + 
+        std::string(kimeraParams_.addGPMotionPriors ? "ENABLED" : "DISABLED") +
+        (kimeraParams_.addGPMotionPriors ? " (type=" + gp_type_str + ", Qc via setGPPriorParams)" : ""));
     appPtr_->getLogger().info("  - Initial position sigma: " + std::to_string(kimeraParams_.initialPositionSigma) + " m");
     appPtr_->getLogger().info("  - Initial roll/pitch sigma: " + std::to_string(kimeraParams_.initialRollPitchSigma) + " rad");
     appPtr_->getLogger().info("  - Initial yaw sigma: " + std::to_string(kimeraParams_.initialYawSigma) + " rad");
@@ -439,6 +456,233 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
   return true;
 }
 
+bool GraphTimeCentricKimera::addGPMotionPrior(
+    size_t state_i_idx,
+    size_t state_j_idx,
+    double dt,
+    const OmegaAtState& omega_i,
+    const OmegaAtState& omega_j) {
+  
+  // Check if GP prior params have been initialized (via setGPPriorParams from VioBackend)
+  if (!gp_params_initialized_ || !gp_qc_model_) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera::addGPMotionPrior: Qc noise model not initialized " +
+                              std::string("- skipping (ensure setGPPriorParams is called)"));
+    return false;
+  }
+  
+  // Validate omega data
+  if (!omega_i.valid || !omega_j.valid) {
+    appPtr_->getLogger().warn("GraphTimeCentricKimera::addGPMotionPrior: Invalid omega for states " +
+                              std::to_string(state_i_idx) + " and " + std::to_string(state_j_idx));
+    return false;
+  }
+  
+  // Get pose/velocity keys
+  gtsam::Key pose_i = X(state_i_idx);
+  gtsam::Key vel_i = V(state_i_idx);
+  gtsam::Key pose_j = X(state_j_idx);
+  gtsam::Key vel_j = V(state_j_idx);
+  
+  // Create omega keys
+  gtsam::Key omega_key_i = W(state_i_idx);
+  gtsam::Key omega_key_j = W(state_j_idx);
+  
+  // Get timestamps for the states
+  double timestamp_i = 0.0, timestamp_j = 0.0;
+  if (keyTimestampMap_.find(pose_i) != keyTimestampMap_.end()) {
+    timestamp_i = keyTimestampMap_[pose_i];
+  }
+  if (keyTimestampMap_.find(pose_j) != keyTimestampMap_.end()) {
+    timestamp_j = keyTimestampMap_[pose_j];
+  }
+  
+  // Add omega_i to values if not already present
+  if (!values_.exists(omega_key_i)) {
+    values_.insert(omega_key_i, omega_i.omega);
+    new_values_since_last_opt_.insert(omega_key_i, omega_i.omega);
+    keyTimestampMap_[omega_key_i] = timestamp_i;
+    new_key_timestamps_since_last_opt_[omega_key_i] = timestamp_i;
+    
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega key W(" + 
+                               std::to_string(state_i_idx) + ") = [" +
+                               std::to_string(omega_i.omega.x()) + ", " +
+                               std::to_string(omega_i.omega.y()) + ", " +
+                               std::to_string(omega_i.omega.z()) + "] rad/s");
+  }
+  
+  // Add omega_j to values if not already present
+  if (!values_.exists(omega_key_j)) {
+    values_.insert(omega_key_j, omega_j.omega);
+    new_values_since_last_opt_.insert(omega_key_j, omega_j.omega);
+    keyTimestampMap_[omega_key_j] = timestamp_j;
+    new_key_timestamps_since_last_opt_[omega_key_j] = timestamp_j;
+    
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega key W(" + 
+                               std::to_string(state_j_idx) + ") = [" +
+                               std::to_string(omega_j.omega.x()) + ", " +
+                               std::to_string(omega_j.omega.y()) + ", " +
+                               std::to_string(omega_j.omega.z()) + "] rad/s");
+  }
+  
+  // Create GP motion prior based on gpType
+  std::string gp_type_name;
+  
+  switch (kimeraParams_.gpType) {
+    case fgo::data::GPModelType::WNOA: {
+      auto gp_prior = boost::make_shared<fgo::factor::GPWNOAPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_prior);
+      new_factors_since_last_opt_.push_back(gp_prior);
+      gp_type_name = "GPWNOAPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::WNOJ: {
+      gtsam::Vector6 acc_i = omega_i.getAccVector6();
+      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      
+      auto gp_prior = boost::make_shared<fgo::factor::GPWNOJPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          acc_i, acc_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_prior);
+      new_factors_since_last_opt_.push_back(gp_prior);
+      gp_type_name = "GPWNOJPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::WNOA_WNOJ: {
+      auto gp_wnoa = boost::make_shared<fgo::factor::GPWNOAPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_wnoa);
+      new_factors_since_last_opt_.push_back(gp_wnoa);
+      
+      gtsam::Vector6 acc_i = omega_i.getAccVector6();
+      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      
+      auto gp_wnoj = boost::make_shared<fgo::factor::GPWNOJPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          acc_i, acc_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_wnoj);
+      new_factors_since_last_opt_.push_back(gp_wnoj);
+      
+      gp_type_name = "GPWNOAPrior + GPWNOJPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::Singer: {
+      gtsam::Vector6 acc_i = omega_i.getAccVector6();
+      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      
+      auto gp_prior = boost::make_shared<fgo::factor::GPSingerPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_, gp_ad_matrix_,
+          acc_i, acc_j,
+          false, true);
+      this->push_back(gp_prior);
+      new_factors_since_last_opt_.push_back(gp_prior);
+      gp_type_name = "GPSingerPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::WNOA_Singer: {
+      auto gp_wnoa = boost::make_shared<fgo::factor::GPWNOAPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_wnoa);
+      new_factors_since_last_opt_.push_back(gp_wnoa);
+      
+      gtsam::Vector6 acc_i = omega_i.getAccVector6();
+      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      
+      auto gp_singer = boost::make_shared<fgo::factor::GPSingerPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_, gp_ad_matrix_,
+          acc_i, acc_j,
+          false, true);
+      this->push_back(gp_singer);
+      new_factors_since_last_opt_.push_back(gp_singer);
+      
+      gp_type_name = "GPWNOAPrior + GPSingerPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::WNOA_WNOJ_Singer: {
+      gtsam::Vector6 acc_i = omega_i.getAccVector6();
+      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      
+      auto gp_wnoa = boost::make_shared<fgo::factor::GPWNOAPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_wnoa);
+      new_factors_since_last_opt_.push_back(gp_wnoa);
+      
+      auto gp_wnoj = boost::make_shared<fgo::factor::GPWNOJPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          acc_i, acc_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_wnoj);
+      new_factors_since_last_opt_.push_back(gp_wnoj);
+      
+      auto gp_singer = boost::make_shared<fgo::factor::GPSingerPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_, gp_ad_matrix_,
+          acc_i, acc_j,
+          false, true);
+      this->push_back(gp_singer);
+      new_factors_since_last_opt_.push_back(gp_singer);
+      
+      gp_type_name = "GPWNOAPrior + GPWNOJPrior + GPSingerPrior";
+      break;
+    }
+    
+    case fgo::data::GPModelType::WNOJFull:
+    case fgo::data::GPModelType::SingerFull: {
+      appPtr_->getLogger().warn("GraphTimeCentricKimera: Full GP variant not implemented, using WNOA");
+      auto gp_prior = boost::make_shared<fgo::factor::GPWNOAPrior>(
+          pose_i, vel_i, omega_key_i,
+          pose_j, vel_j, omega_key_j,
+          dt, gp_qc_model_,
+          false, true);
+      this->push_back(gp_prior);
+      new_factors_since_last_opt_.push_back(gp_prior);
+      gp_type_name = "GPWNOAPrior (fallback)";
+      break;
+    }
+      
+    default:
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Unknown GP model type: " +
+                                 std::to_string(static_cast<int>(kimeraParams_.gpType)));
+      return false;
+  }
+  
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Added " + gp_type_name + " between states " + 
+                            std::to_string(state_i_idx) + " and " + std::to_string(state_j_idx) +
+                            " (dt=" + std::to_string(dt) + "s)");
+  
+  return true;
+}
+
 bool GraphTimeCentricKimera::addPreintegratedIMUData(
     const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data) {
   
@@ -465,106 +709,6 @@ bool GraphTimeCentricKimera::addPreintegratedIMUData(
   return true;
 }
 
-// ========================================================================
-// GP MOTION PRIORS - COMMENTED OUT FOR IMU ISOLATION TESTING
-// ========================================================================
-
-/*
-bool GraphTimeCentricKimera::addGPMotionPriorsForStates(const std::vector<size_t>& state_indices) {
-  if (state_indices.size() < 2) {
-    appPtr_->getLogger().warn("GraphTimeCentricKimera: Need at least 2 states for GP priors");
-    return true;
-  }
-
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Adding GP motion priors for " +
-                            std::to_string(state_indices.size() - 1) + " state pairs");
-
-  for (size_t i = 1; i < state_indices.size(); ++i) {
-    if (!addGPMotionPriorBetweenStates(state_indices[i-1], state_indices[i])) {
-      return false;
-    }
-  }
-
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Successfully added " +
-                            std::to_string(state_indices.size() - 1) + " GP motion priors");
-
-  return true;
-}
-
-bool GraphTimeCentricKimera::addGPMotionPriorBetweenStates(size_t state_i_idx, size_t state_j_idx) {
-  try {
-    // Get keys
-    gtsam::Key pose_i = X(state_i_idx);
-    gtsam::Key vel_i = V(state_i_idx);
-    gtsam::Key omega_i = W(state_i_idx);
-    gtsam::Key acc_i = A(state_i_idx);
-    gtsam::Key pose_j = X(state_j_idx);
-    gtsam::Key vel_j = V(state_j_idx);
-    gtsam::Key omega_j = W(state_j_idx);
-    gtsam::Key acc_j = A(state_j_idx);
-
-    // Calculate dt
-    double ts_i = keyTimestampMap_[pose_i];
-    double ts_j = keyTimestampMap_[pose_j];
-    double dt = ts_j - ts_i;
-
-    if (dt <= 0.0) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: Invalid dt " + std::to_string(dt) +
-                                 " between states " + std::to_string(state_i_idx) +
-                                 " and " + std::to_string(state_j_idx));
-      return false;
-    }
-
-    // Get acceleration values if needed for WNOJ/WNOJFull
-    gtsam::Vector6 acc_i_val = gtsam::Vector6::Zero();
-    gtsam::Vector6 acc_j_val = gtsam::Vector6::Zero();
-
-    if (graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJ ||
-        graphBaseParamPtr_->gpType == fgo::data::GPModelType::WNOJFull ||
-        graphBaseParamPtr_->gpType == fgo::data::GPModelType::Singer ||
-        graphBaseParamPtr_->gpType == fgo::data::GPModelType::SingerFull) {
-
-      // Try to get from accBuffer or use zero
-      if (accBuffer_.size() > state_i_idx) {
-        acc_i_val = accBuffer_.get_buffer_from_id(state_i_idx);
-      }
-
-      if (accBuffer_.size() > state_j_idx) {
-        acc_j_val = accBuffer_.get_buffer_from_id(state_j_idx);
-      }
-    }
-
-    // Call base class helper to add GP prior
-    gtsam::Matrix6 ad = gtsam::Matrix6::Identity();
-
-    this->addGPMotionPrior(pose_i, vel_i, omega_i, acc_i,
-                          pose_j, vel_j, omega_j, acc_j,
-                          dt, acc_i_val, acc_j_val, ad);
-
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added GP motion prior between states " +
-                               std::to_string(state_i_idx) + " and " +
-                               std::to_string(state_j_idx) + " (dt=" + std::to_string(dt) + ")");
-
-    return true;
-
-  } catch (const std::exception& e) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception while adding GP prior: " +
-                               std::string(e.what()));
-    return false;
-  }
-}
-*/
-
-// Stub implementations to satisfy interface (return true, do nothing)
-bool GraphTimeCentricKimera::addGPMotionPriorsForStates(const std::vector<size_t>& /*state_indices*/) {
-  // GP priors disabled for IMU isolation testing
-  return true;
-}
-
-bool GraphTimeCentricKimera::addGPMotionPriorBetweenStates(size_t /*state_i_idx*/, size_t /*state_j_idx*/) {
-  // GP priors disabled for IMU isolation testing
-  return true;
-}
 
 // ========================================================================
 // EXTERNAL FACTOR INTERFACE
@@ -1001,6 +1145,47 @@ void GraphTimeCentricKimera::setStereoCalibration(
   appPtr_->getLogger().info("GraphTimeCentricKimera: Stereo calibration set - baseline: " + 
                             std::to_string(stereo_cal->baseline()) +
                             " (using pre-initialized smart factor params from VioBackend)");
+}
+
+void GraphTimeCentricKimera::setGPPriorParams(
+    const gtsam::SharedNoiseModel& gp_qc_model,
+    const gtsam::Matrix6& gp_ad_matrix,
+    const gtsam::SharedNoiseModel& gp_acc_prior_noise) {
+  gp_qc_model_ = gp_qc_model;
+  gp_ad_matrix_ = gp_ad_matrix;
+  gp_acc_prior_noise_ = gp_acc_prior_noise;
+  gp_params_initialized_ = true;
+  
+  appPtr_->getLogger().info("GraphTimeCentricKimera: GP motion prior params set - "
+                            "Qc model, ad matrix (diag=" + 
+                            std::to_string(gp_ad_matrix_(0,0)) + "/" + 
+                            std::to_string(gp_ad_matrix_(3,3)) + 
+                            "), acc prior (pre-initialized from VioBackend)");
+}
+
+bool GraphTimeCentricKimera::setOmegaForState(size_t state_id, const OmegaAtState& omega_state) {
+  try {
+    if (!omega_state.valid) {
+      appPtr_->getLogger().warn("GraphTimeCentricKimera: Invalid OmegaAtState for state " + 
+                                std::to_string(state_id));
+      return false;
+    }
+    
+    state_omega_[state_id] = omega_state;
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Set omega for state " + 
+                               std::to_string(state_id) + 
+                               ": [" + std::to_string(omega_state.omega.x()) + ", " +
+                               std::to_string(omega_state.omega.y()) + ", " +
+                               std::to_string(omega_state.omega.z()) + "] rad/s" +
+                               " (raw_gyro=[" + std::to_string(omega_state.gyro_raw.x()) + "," +
+                               std::to_string(omega_state.gyro_raw.y()) + "," +
+                               std::to_string(omega_state.gyro_raw.z()) + "])");
+    return true;
+  } catch (const std::exception& e) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception setting omega for state " + 
+                               std::to_string(state_id) + ": " + std::string(e.what()));
+    return false;
+  }
 }
 
 size_t GraphTimeCentricKimera::addStereoMeasurementsToGraph(

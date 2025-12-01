@@ -19,6 +19,7 @@
 
 #include "online_fgo_core/integration/KimeraIntegrationInterface.h"
 #include "online_fgo_core/data/DataTypesFGO.h"
+// Note: OmegaAtState is now defined in KimeraIntegrationInterface.h
 #include <fstream>
 #include <chrono>
 #include <iomanip>
@@ -154,8 +155,9 @@ bool KimeraIntegrationInterface::initialize(const KimeraIntegrationParams& param
     kimera_params.gyroRandomWalk = params.gyro_bias_rw_sigma;   // gyroscope_random_walk
     kimera_params.nominalSamplingTimeS = 1.0 / params.imu_rate; // 1/rate_hz
     
-    // kimera_params.addGPMotionPriors = params.use_gp_priors;  // COMMENTED OUT FOR IMU ISOLATION TESTING
-    kimera_params.addGPMotionPriors = false;  // Disabled for IMU testing
+    // GP motion prior configuration (Qc noise model is passed separately via setGPPriorParams)
+    kimera_params.addGPMotionPriors = params.use_gp_priors;
+    kimera_params.gpType = static_cast<fgo::data::GPModelType>(params.gp_model_type);
     kimera_params.optimizeOnKeyframe = params.optimize_on_keyframe;
     
     app_->getLogger().info("KimeraIntegrationInterface: IMU preintegration type = " + 
@@ -297,6 +299,26 @@ std::vector<double> KimeraIntegrationInterface::getAllStateTimestamps() {
   return graph_->getAllStateTimestamps();
 }
 
+bool KimeraIntegrationInterface::setOmegaForState(size_t state_id, const OmegaAtState& omega_state) {
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return false;
+  }
+  
+  if (!omega_state.valid) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Invalid OmegaAtState for state " + 
+                           std::to_string(state_id));
+    return false;
+  }
+  
+  try {
+    return graph_->setOmegaForState(state_id, omega_state);
+  } catch (const std::exception& e) {
+    app_->getLogger().error("KimeraIntegrationInterface: Exception setting omega for state " + 
+                            std::to_string(state_id) + ": " + std::string(e.what()));
+    return false;
+  }
+}
 
 bool KimeraIntegrationInterface::addPreintegratedIMUData(
     const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data) {
@@ -433,6 +455,96 @@ bool KimeraIntegrationInterface::addImuFactorBetween(
   return true;
 }
 
+bool KimeraIntegrationInterface::addImuFactorWithOmega(
+    const StateHandle& previous_state,
+    const StateHandle& current_state,
+    const gtsam::PreintegrationType& pim,
+    const OmegaAtState& omega_from,
+    const OmegaAtState& omega_to) {
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return false;
+  }
+
+  if (!previous_state.valid || !current_state.valid) {
+    app_->getLogger().error("KimeraIntegrationInterface: Invalid state handle(s) supplied for IMU factor with omega");
+    return false;
+  }
+
+  if (previous_state.index == current_state.index) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Skipping IMU factor between identical states");
+    return false;
+  }
+
+  // 1. Add IMU factor (completely separate from GP priors)
+  if (!graph_->addIMUFactorFromPIM(previous_state.index, current_state.index, pim)) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Failed to add IMU factor between states " +
+                           std::to_string(previous_state.index) + " and " +
+                           std::to_string(current_state.index));
+    return false;
+  }
+  
+  app_->getLogger().debug("KimeraIntegrationInterface: Added IMU factor from state " +
+                          std::to_string(previous_state.index) + " to " +
+                          std::to_string(current_state.index));
+
+  // 2. Add GP motion prior (completely separate from IMU factor)
+  if (params_.use_gp_priors && omega_from.valid && omega_to.valid) {
+    const double dt = pim.deltaTij();
+    
+    if (!graph_->addGPMotionPrior(previous_state.index, current_state.index, 
+                                   dt, omega_from, omega_to)) {
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to add GP motion prior between states " +
+                             std::to_string(previous_state.index) + " and " +
+                             std::to_string(current_state.index) + " (continuing without GP prior)");
+      // Don't fail - IMU factor was added successfully
+    }
+  }
+
+  if (params_.optimize_on_keyframe) {
+    app_->getLogger().info(
+        "KimeraIntegrationInterface: IMU factor added; expect external smoother to consume incremental update");
+  }
+
+  return true;
+}
+
+bool KimeraIntegrationInterface::addGPMotionPrior(
+    const StateHandle& previous_state,
+    const StateHandle& current_state,
+    double dt,
+    const OmegaAtState& omega_from,
+    const OmegaAtState& omega_to) {
+  if (!initialized_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
+    return false;
+  }
+
+  if (!previous_state.valid || !current_state.valid) {
+    app_->getLogger().error("KimeraIntegrationInterface: Invalid state handle(s) for GP motion prior");
+    return false;
+  }
+
+  if (!omega_from.valid || !omega_to.valid) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Invalid omega data for GP motion prior");
+    return false;
+  }
+
+  if (!graph_->addGPMotionPrior(previous_state.index, current_state.index,
+                                 dt, omega_from, omega_to)) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Failed to add GP motion prior between states " +
+                           std::to_string(previous_state.index) + " and " +
+                           std::to_string(current_state.index));
+    return false;
+  }
+
+  app_->getLogger().debug("KimeraIntegrationInterface: Added GP motion prior from state " +
+                          std::to_string(previous_state.index) + " to " +
+                          std::to_string(current_state.index));
+
+  return true;
+}
+
 // ========================================================================
 // FACTOR INSERTION
 // ========================================================================
@@ -491,6 +603,7 @@ void KimeraIntegrationInterface::updateParameters(const KimeraIntegrationParams&
     fgo::graph::GraphTimeCentricKimeraParams kimera_params;
     kimera_params.imuStateFrequency = params.imu_rate;
     kimera_params.addGPMotionPriors = params.use_gp_priors;
+    kimera_params.gpType = static_cast<fgo::data::GPModelType>(params.gp_model_type);
     kimera_params.optimizeOnKeyframe = params.optimize_on_keyframe;
     
     graph_->setKimeraParams(kimera_params);
@@ -516,6 +629,19 @@ void KimeraIntegrationInterface::setStereoCalibration(
   
   graph_->setStereoCalibration(stereo_cal, B_Pose_leftCam, smart_noise, smart_params);
   app_->getLogger().info("KimeraIntegrationInterface: Stereo calibration and smart factor params set");
+}
+
+void KimeraIntegrationInterface::setGPPriorParams(
+    const gtsam::SharedNoiseModel& gp_qc_model,
+    const gtsam::Matrix6& gp_ad_matrix,
+    const gtsam::SharedNoiseModel& gp_acc_prior_noise) {
+  if (!graph_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Graph not initialized, cannot set GP prior params");
+    return;
+  }
+  
+  graph_->setGPPriorParams(gp_qc_model, gp_ad_matrix, gp_acc_prior_noise);
+  app_->getLogger().info("KimeraIntegrationInterface: GP motion prior params set (Qc, ad, acc_prior)");
 }
 
 size_t KimeraIntegrationInterface::addStereoMeasurements(

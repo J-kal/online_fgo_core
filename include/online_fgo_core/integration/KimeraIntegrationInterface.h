@@ -42,6 +42,170 @@
 
 namespace fgo::integration {
 
+/**
+ * @brief IMU state at a specific keyframe (omega and acceleration)
+ * 
+ * Used for GP motion priors which require instantaneous angular velocity
+ * and/or acceleration at state boundaries:
+ *   - WNOA (White Noise on Acceleration): requires omega only
+ *   - WNOJ (White Noise on Jerk): requires omega + acceleration measurements
+ *   - Singer: requires omega + acceleration + damping matrix
+ * 
+ * This struct encapsulates both omega and acceleration values along with
+ * their provenance (raw IMU data, biases used for correction).
+ * 
+ * Similar to how PIM encapsulates preintegrated IMU data, OmegaAtState
+ * encapsulates the instantaneous IMU state needed for motion priors.
+ * 
+ * Defined here in the integration interface so both Kimera-VIO and 
+ * online_fgo_core can use it without circular dependencies.
+ */
+struct OmegaAtState {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  
+  /// Bias-corrected angular velocity in body frame (rad/s)
+  /// omega = gyro_raw - gyro_bias
+  gtsam::Vector3 omega = gtsam::Vector3::Zero();
+  
+  /// Bias-corrected linear acceleration in body frame (m/s^2)
+  /// acc = acc_raw - acc_bias
+  /// Note: This is proper acceleration (includes gravity in body frame)
+  gtsam::Vector3 acc = gtsam::Vector3::Zero();
+  
+  /// Raw gyroscope measurement (rad/s)
+  gtsam::Vector3 gyro_raw = gtsam::Vector3::Zero();
+  
+  /// Raw accelerometer measurement (m/s^2)
+  gtsam::Vector3 acc_raw = gtsam::Vector3::Zero();
+  
+  /// Gyroscope bias used for correction (rad/s)
+  gtsam::Vector3 gyro_bias = gtsam::Vector3::Zero();
+  
+  /// Accelerometer bias used for correction (m/s^2)
+  gtsam::Vector3 acc_bias = gtsam::Vector3::Zero();
+  
+  /// Timestamp of the measurement (nanoseconds)
+  int64_t timestamp = 0;
+  
+  /// Validity flag - false if not properly initialized
+  bool valid = false;
+  
+  /// Default constructor (invalid state)
+  OmegaAtState() = default;
+  
+  /// Full constructor (omega only - backwards compatible)
+  OmegaAtState(const gtsam::Vector3& omega_val,
+               const gtsam::Vector3& gyro_raw_val,
+               const gtsam::Vector3& gyro_bias_val,
+               int64_t ts)
+      : omega(omega_val),
+        gyro_raw(gyro_raw_val),
+        gyro_bias(gyro_bias_val),
+        timestamp(ts),
+        valid(true) {}
+  
+  /// Full constructor with acceleration
+  OmegaAtState(const gtsam::Vector3& omega_val,
+               const gtsam::Vector3& acc_val,
+               const gtsam::Vector3& gyro_raw_val,
+               const gtsam::Vector3& acc_raw_val,
+               const gtsam::Vector3& gyro_bias_val,
+               const gtsam::Vector3& acc_bias_val,
+               int64_t ts)
+      : omega(omega_val),
+        acc(acc_val),
+        gyro_raw(gyro_raw_val),
+        acc_raw(acc_raw_val),
+        gyro_bias(gyro_bias_val),
+        acc_bias(acc_bias_val),
+        timestamp(ts),
+        valid(true) {}
+  
+  /**
+   * @brief Factory method to create OmegaAtState from raw gyro and bias only
+   * @param gyro Raw gyroscope measurement (rad/s)
+   * @param gyro_bias Gyroscope bias vector
+   * @param ts Timestamp of measurement
+   * @return Properly initialized OmegaAtState (omega only, acc zeroed)
+   */
+  static OmegaAtState fromGyroAndBias(const gtsam::Vector3& gyro,
+                                       const gtsam::Vector3& gyro_bias,
+                                       int64_t ts) {
+    return OmegaAtState(
+        gyro - gyro_bias,  // Bias-corrected omega
+        gyro,              // Raw gyro
+        gyro_bias,         // Gyro bias
+        ts);
+  }
+  
+  /**
+   * @brief Factory method to create from IMU AccGyr vector (6x1) - omega only
+   * @param imu_accgyr 6x1 vector [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z]
+   * @param gyro_bias Gyroscope bias vector
+   * @param ts Timestamp of measurement
+   * @return Properly initialized OmegaAtState (omega only)
+   * @deprecated Use fromImuAccGyrFull for WNOJ support
+   */
+  static OmegaAtState fromImuAccGyr(const Eigen::Matrix<double, 6, 1>& imu_accgyr,
+                                     const gtsam::Vector3& gyro_bias,
+                                     int64_t ts) {
+    gtsam::Vector3 gyro = imu_accgyr.tail<3>();
+    return fromGyroAndBias(gyro, gyro_bias, ts);
+  }
+  
+  /**
+   * @brief Factory method to create from IMU AccGyr vector (6x1) with full bias
+   * @param imu_accgyr 6x1 vector [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z]
+   * @param imu_bias Full IMU bias (accelerometer + gyroscope)
+   * @param ts Timestamp of measurement
+   * @return Properly initialized OmegaAtState with omega AND acceleration
+   * 
+   * This is the preferred factory method for WNOJ and Singer GP priors.
+   */
+  static OmegaAtState fromImuAccGyrFull(const Eigen::Matrix<double, 6, 1>& imu_accgyr,
+                                         const gtsam::imuBias::ConstantBias& imu_bias,
+                                         int64_t ts) {
+    gtsam::Vector3 acc_raw = imu_accgyr.head<3>();
+    gtsam::Vector3 gyro_raw = imu_accgyr.tail<3>();
+    gtsam::Vector3 acc_bias = imu_bias.accelerometer();
+    gtsam::Vector3 gyro_bias = imu_bias.gyroscope();
+    
+    return OmegaAtState(
+        gyro_raw - gyro_bias,   // Bias-corrected omega
+        acc_raw - acc_bias,     // Bias-corrected acceleration
+        gyro_raw,               // Raw gyro
+        acc_raw,                // Raw acc
+        gyro_bias,              // Gyro bias
+        acc_bias,               // Acc bias
+        ts);
+  }
+  
+  /**
+   * @brief Get combined 6-DOF acceleration vector for GP priors
+   * @return 6x1 vector [linear_acc (3), angular_acc (3)]
+   * 
+   * Note: Angular acceleration is approximated as zero (instantaneous omega).
+   * For WNOJ, this represents the "acceleration" state in the GP formulation.
+   */
+  gtsam::Vector6 getAccVector6() const {
+    // GP priors use 6-DOF state: [linear (3), angular (3)]
+    // Linear = bias-corrected accelerometer reading
+    // Angular = rate of change of omega (approximated as 0 at instantaneous measurement)
+    gtsam::Vector6 acc_vec;
+    acc_vec << acc, gtsam::Vector3::Zero();  // Angular acceleration = 0 (instantaneous)
+    return acc_vec;
+  }
+  
+  /// Print for debugging
+  void print(const std::string& prefix = "") const {
+    std::cout << prefix << "OmegaAtState: "
+              << "omega=[" << omega.transpose() << "] rad/s, "
+              << "gyro_raw=[" << gyro_raw.transpose() << "], "
+              << "gyro_bias=[" << gyro_bias.transpose() << "], "
+              << "ts=" << timestamp << ", valid=" << valid << std::endl;
+  }
+};
+
   /**
    * @brief Parameters for Kimera integration
    */
@@ -64,9 +228,10 @@ namespace fgo::integration {
     // 1 = kPreintegratedImuMeasurements (ImuFactor + bias BetweenFactor)
     int imu_preintegration_type = 0;
     
-    // GP prior parameters
-    bool use_gp_priors = true;
-    std::string gp_type = "WNOJ";  // WNOA, WNOJ, WNOJFull, Singer, SingerFull
+    // GP motion prior configuration
+    // The Qc noise model is passed separately via setGPPriorParams (following visual factors pattern)
+    bool use_gp_priors = false;           // Enable GP motion priors between consecutive states
+    int gp_model_type = 0;                // 0=WNOA, 1=WNOJ, 2=WNOJFull, 3=Singer, 4=SingerFull
     
     // Optimization parameters
     bool optimize_on_keyframe = true;
@@ -240,6 +405,43 @@ namespace fgo::integration {
     bool addImuFactorBetween(const StateHandle& previous_state,
                              const StateHandle& current_state,
                              std::shared_ptr<gtsam::PreintegrationType> pim);
+    
+    /**
+     * @brief Add IMU factor with omega data, optionally followed by GP prior
+     * @param previous_state Handle to the previous state
+     * @param current_state Handle to the current state
+     * @param pim Preintegrated IMU measurement
+     * @param omega_from OmegaAtState for the previous state
+     * @param omega_to OmegaAtState for the current state
+     * @return True if IMU factor added successfully
+     * 
+     * Adds IMU factor first, then adds GP motion prior if:
+     * - params_.use_gp_priors is true
+     * - omega_from and omega_to are valid
+     * The two operations are completely decoupled internally.
+     */
+    bool addImuFactorWithOmega(const StateHandle& previous_state,
+                               const StateHandle& current_state,
+                               const gtsam::PreintegrationType& pim,
+                               const OmegaAtState& omega_from,
+                               const OmegaAtState& omega_to);
+    
+    /**
+     * @brief Add GP motion prior factor between two states (standalone)
+     * @param previous_state Handle to the previous state
+     * @param current_state Handle to the current state
+     * @param dt Time delta between states (seconds)
+     * @param omega_from OmegaAtState for the previous state
+     * @param omega_to OmegaAtState for the current state
+     * @return True if GP prior added successfully
+     * 
+     * Can be called independently of addImuFactorBetween/addImuFactorWithOmega.
+     */
+    bool addGPMotionPrior(const StateHandle& previous_state,
+                          const StateHandle& current_state,
+                          double dt,
+                          const OmegaAtState& omega_from,
+                          const OmegaAtState& omega_to);
 
     // ========================================================================
     // VISUAL FACTOR INTERFACE
@@ -263,6 +465,30 @@ namespace fgo::integration {
                               const gtsam::Pose3& B_Pose_leftCam,
                               const gtsam::SharedNoiseModel& smart_noise,
                               const gtsam::SmartProjectionParams& smart_params);
+    
+    /**
+     * @brief Set GP motion prior parameters
+     * @param gp_qc_model Pre-initialized Qc noise model for GP priors (from VioBackend)
+     * @param gp_ad_matrix Singer model acceleration damping matrix
+     * @param gp_acc_prior_noise Prior noise for acceleration state (Full variants)
+     * 
+     * This follows the same pattern as setStereoCalibration - VioBackend creates
+     * all parameters and passes them pre-initialized to ensure consistency.
+     */
+    void setGPPriorParams(const gtsam::SharedNoiseModel& gp_qc_model,
+                          const gtsam::Matrix6& gp_ad_matrix,
+                          const gtsam::SharedNoiseModel& gp_acc_prior_noise);
+    
+    /**
+     * @brief Set angular velocity (omega) for a state
+     * Used for full GP motion priors which require omega as a state variable
+     * @param state_id Frame/state ID
+     * @param omega_state OmegaAtState containing bias-corrected angular velocity
+     * @return True if successful
+     * 
+     * OmegaAtState encapsulates: omega = gyro_meas - gyro_bias
+     */
+    bool setOmegaForState(size_t state_id, const OmegaAtState& omega_state);
 
     /**
      * @brief Add stereo visual measurements for a keyframe
