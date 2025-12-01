@@ -1,0 +1,18 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Find required dependencies
+find_dependency(Eigen3 3.3.5 REQUIRED)
+find_dependency(Boost REQUIRED COMPONENTS system)
+find_dependency(GTSAM REQUIRED)
+find_dependency(GTSAM_UNSTABLE REQUIRED)
+find_dependency(GeographicLib REQUIRED)
+find_dependency(TBB REQUIRED COMPONENTS tbb tbbmalloc)
+
+# Optional dependencies
+find_package(yaml-cpp QUIET)
+
+include("${CMAKE_CURRENT_LIST_DIR}/online_fgo_coreTargets.cmake")
+
+check_required_components(online_fgo_core)

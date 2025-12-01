@@ -34,7 +34,6 @@
 #include <mutex>
 #include <map>
 #include <unordered_map>
-#include <optional>
 
 namespace fgo::graph {
 
@@ -204,21 +203,37 @@ public:
      * Mirrors Kimera-VIO's addStateValues() path to keep the integration steps
      * (state initialization vs. factor creation) decoupled.
      *
-     * @return state index (>=1) if successful, 0 otherwise
+     * @param timestamp Timestamp in seconds
+     * @param frame_id Kimera frame ID to use as state index (ensures key alignment with VioBackend)
+     * @param pose Initial pose estimate
+     * @param velocity Initial velocity estimate
+     * @param bias Initial IMU bias estimate
+     * @param[out] out_state_idx The created state index (valid only if function returns true)
+     * @return true if successful, false otherwise
      */
-    size_t addKeyframeState(double timestamp,
-                            const gtsam::Pose3& pose,
-                            const gtsam::Vector3& velocity,
-                            const gtsam::imuBias::ConstantBias& bias);
+    bool addKeyframeState(double timestamp,
+                          size_t frame_id,
+                          const gtsam::Pose3& pose,
+                          const gtsam::Vector3& velocity,
+                          const gtsam::imuBias::ConstantBias& bias,
+                          size_t& out_state_idx);
 
     /**
      * @brief Initialize graph with the very first state and priors
-     * @return true if bootstrap succeeded
+     * @param timestamp Timestamp in seconds
+     * @param frame_id Kimera frame ID to use as state index (ensures key alignment with VioBackend)
+     * @param pose Initial pose estimate
+     * @param velocity Initial velocity estimate
+     * @param bias Initial IMU bias estimate
+     * @param[out] out_state_idx The created state index (valid only if function returns true)
+     * @return true if bootstrap succeeded, false otherwise
      */
-    size_t bootstrapInitialState(double timestamp,
-                                 const gtsam::Pose3& pose,
-                                 const gtsam::Vector3& velocity,
-                                 const gtsam::imuBias::ConstantBias& bias);
+    bool bootstrapInitialState(double timestamp,
+                               size_t frame_id,
+                               const gtsam::Pose3& pose,
+                               const gtsam::Vector3& velocity,
+                               const gtsam::imuBias::ConstantBias& bias,
+                               size_t& out_state_idx);
 
     // ========================================================================
     // IMU MEASUREMENT HANDLING - Buffer and integrate IMU data

@@ -314,6 +314,7 @@ bool KimeraIntegrationInterface::addPreintegratedIMUData(
 
 StateHandle KimeraIntegrationInterface::addKeyframeState(
     double timestamp,
+    size_t frame_id,
     const gtsam::Pose3& pose,
     const gtsam::Vector3& velocity,
     const gtsam::imuBias::ConstantBias& bias) {
@@ -323,11 +324,12 @@ StateHandle KimeraIntegrationInterface::addKeyframeState(
   }
 
   std::cout << "[online_fgo_core] KimeraIntegrationInterface: ADD KEYFRAME STATE AT TIMESTAMP "
-            << timestamp << std::endl;
+            << timestamp << " WITH FRAME_ID " << frame_id << std::endl;
 
   try {
-    size_t state_idx = graph_->addKeyframeState(timestamp, pose, velocity, bias);
-    if (state_idx == 0) {
+    size_t state_idx = 0;
+    bool success = graph_->addKeyframeState(timestamp, frame_id, pose, velocity, bias, state_idx);
+    if (!success) {
       app_->getLogger().error("KimeraIntegrationInterface: Failed to add keyframe state at timestamp " +
                               std::to_string(timestamp));
       return StateHandle();
@@ -345,6 +347,7 @@ StateHandle KimeraIntegrationInterface::addKeyframeState(
 
 StateHandle KimeraIntegrationInterface::bootstrapInitialState(
     double timestamp,
+    size_t frame_id,
     const gtsam::Pose3& pose,
     const gtsam::Vector3& velocity,
     const gtsam::imuBias::ConstantBias& bias) {
@@ -354,11 +357,12 @@ StateHandle KimeraIntegrationInterface::bootstrapInitialState(
   }
 
   app_->getLogger().info("KimeraIntegrationInterface: BOOTSTRAP INITIAL STATE at "
-                         + std::to_string(timestamp));
+                         + std::to_string(timestamp) + " with frame_id " + std::to_string(frame_id));
 
   try {
-    size_t state_idx = graph_->bootstrapInitialState(timestamp, pose, velocity, bias);
-    if (state_idx == 0) {
+    size_t state_idx = 0;
+    bool success = graph_->bootstrapInitialState(timestamp, frame_id, pose, velocity, bias, state_idx);
+    if (!success) {
       app_->getLogger().error("KimeraIntegrationInterface: Failed to bootstrap initial state");
       return StateHandle();
     }

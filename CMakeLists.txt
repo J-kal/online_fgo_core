@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16...3.26)
 project(online_fgo_core VERSION 0.1.0)
 
+# Manually set GeographicLib paths for workspace-wide install
+set(GeographicLib_INCLUDE_DIR "/workspaces/build/include")
+set(GeographicLib_LIBRARY "/workspaces/build/lib/libGeographic.so")
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +32,14 @@ find_package(Boost REQUIRED COMPONENTS system)
 find_package(GTSAM REQUIRED)
 find_package(GTSAM_UNSTABLE REQUIRED)
 find_package(GeographicLib REQUIRED)
+# Fallback to manually set paths if not found
+
+if(NOT GeographicLib_LIBRARIES)
+    set(GeographicLib_LIBRARIES "${GeographicLib_LIBRARY}")
+endif()
+if(NOT GeographicLib_INCLUDE_DIRS)
+    set(GeographicLib_INCLUDE_DIRS "${GeographicLib_INCLUDE_DIR}")
+endif()
 find_package(TBB REQUIRED COMPONENTS tbb tbbmalloc)
 
 # Determine GeographicLib library to link
@@ -66,6 +78,7 @@ target_include_directories(online_fgo_interface
         ${GTSAM_INCLUDE_DIR}
         ${Boost_INCLUDE_DIR}
         ${EIGEN3_INCLUDE_DIR}
+        ${GeographicLib_INCLUDE_DIR}
 )
 
 target_link_libraries(online_fgo_interface
@@ -85,7 +98,7 @@ set(ONLINEFGO_CORE_INCLUDE
     ${GTSAM_INCLUDE_DIR}
     ${Boost_INCLUDE_DIR}
     ${EIGEN3_INCLUDE_DIR}
-    ${GeographicLib_INCLUDE_DIRS}
+    ${GeographicLib_INCLUDE_DIR}
 )
 
 set(ONLINEFGO_CORE_LINK
@@ -94,7 +107,7 @@ set(ONLINEFGO_CORE_LINK
     gtsam_unstable
     Eigen3::Eigen
     ${Boost_LIBRARIES}
-    ${GEOGRAPHICLIB_LIB}
+    ${GeographicLib_LIBRARIES}
     TBB::tbb
     TBB::tbbmalloc
 )
@@ -289,6 +302,9 @@ write_basic_package_version_file(
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY AnyNewerVersion
 )
+
+# Export targets for the build tree, so online_fgo_coreConfig.cmake in the build tree can find them
+export(EXPORT online_fgo_core_targets FILE "${CMAKE_CURRENT_BINARY_DIR}/online_fgo_coreTargets.cmake" NAMESPACE online_fgo_core::)
 
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/online_fgo_coreConfig.cmake

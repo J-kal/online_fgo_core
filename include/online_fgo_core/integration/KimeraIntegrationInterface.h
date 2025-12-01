@@ -218,11 +218,13 @@ namespace fgo::integration {
         const std::vector<std::pair<double, std::shared_ptr<gtsam::PreintegrationType>>>& pim_data);
 
     StateHandle addKeyframeState(double timestamp,
+                                 size_t frame_id,
                                  const gtsam::Pose3& pose,
                                  const gtsam::Vector3& velocity,
                                  const gtsam::imuBias::ConstantBias& bias);
 
     StateHandle bootstrapInitialState(double timestamp,
+                                      size_t frame_id,
                                       const gtsam::Pose3& pose,
                                       const gtsam::Vector3& velocity,
                                       const gtsam::imuBias::ConstantBias& bias);

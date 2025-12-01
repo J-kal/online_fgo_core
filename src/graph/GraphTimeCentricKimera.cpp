@@ -160,56 +160,97 @@ std::vector<double> GraphTimeCentricKimera::getAllStateTimestamps() const {
   return timestamps;
 }
 
-size_t GraphTimeCentricKimera::addKeyframeState(double timestamp,
-                                                const gtsam::Pose3& pose,
-                                                const gtsam::Vector3& velocity,
-                                                const gtsam::imuBias::ConstantBias& bias) {
-  size_t state_idx = findOrCreateStateForTimestamp(timestamp, true);
-  if (state_idx == 0) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to create state at timestamp " +
-                               std::to_string(timestamp));
-    return 0;
+bool GraphTimeCentricKimera::addKeyframeState(double timestamp,
+                                              size_t frame_id,
+                                              const gtsam::Pose3& pose,
+                                              const gtsam::Vector3& velocity,
+                                              const gtsam::imuBias::ConstantBias& bias,
+                                              size_t& out_state_idx) {
+  // Use Kimera's frame_id as the state index to ensure key alignment with VioBackend
+  // This ensures that X(frame_id), V(frame_id), B(frame_id) keys match what VioBackend expects
+  size_t state_idx = frame_id;
+  
+  // Check if state already exists at this index
+  gtsam::Key pose_key = X(state_idx);
+  if (values_.exists(pose_key)) {
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: State " + std::to_string(state_idx) + 
+                               " already exists, updating values");
+  } else {
+    // Create initial values for the new state
+    if (!createInitialValuesForState(state_idx, timestamp)) {
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to create initial values for state " +
+                                 std::to_string(state_idx));
+      return false;
+    }
+    // Update timestamp mapping
+    updateTimestampIndex(timestamp, state_idx);
   }
-bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
-  if (! initial_values_set) {
+  
+  // Track the highest state index for nState_
+  if (state_idx > nState_) {
+    nState_ = state_idx;
+  }
+  
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Creating new state " + 
+                            std::to_string(state_idx) + " at timestamp " + 
+                            std::to_string(timestamp));
+  
+  bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
+  if (!initial_values_set) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to set initial values for state " +
                               std::to_string(state_idx));
-    return 0;
+    return false;
   }
   appPtr_->getLogger().info("GraphTimeCentricKimera: Initial values set for state " +
                             std::to_string(state_idx));
-  return state_idx;
+  out_state_idx = state_idx;
+  return true;
 }
 
-size_t GraphTimeCentricKimera::bootstrapInitialState(double timestamp,
-                                                     const gtsam::Pose3& pose,
-                                                     const gtsam::Vector3& velocity,
-                                                     const gtsam::imuBias::ConstantBias& bias) {
+bool GraphTimeCentricKimera::bootstrapInitialState(double timestamp,
+                                                   size_t frame_id,
+                                                   const gtsam::Pose3& pose,
+                                                   const gtsam::Vector3& velocity,
+                                                   const gtsam::imuBias::ConstantBias& bias,
+                                                   size_t& out_state_idx) {
   if (first_state_priors_added_) {
     appPtr_->getLogger().warn("GraphTimeCentricKimera: bootstrapInitialState called twice");
-    return 0;
+    return false;
   }
 
-  size_t state_idx = findOrCreateStateForTimestamp(timestamp, true);
-  if (state_idx == 0) {
+  // Use Kimera's frame_id as the state index to ensure key alignment with VioBackend
+  size_t state_idx = frame_id;
+  
+  // Create initial values for the state
+  if (!createInitialValuesForState(state_idx, timestamp)) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: failed to create initial state");
-    return 0;
+    return false;
   }
+  
+  // Update timestamp mapping
+  updateTimestampIndex(timestamp, state_idx);
+  
+  // Track the highest state index for nState_
+  if (state_idx > nState_) {
+    nState_ = state_idx;
+  }
+  
   bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
   if (!initial_values_set) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: failed to set initial values during bootstrap");
-    return 0;
+    return false;
   }
 
   bool priors_added = addPriorFactorsToFirstState(state_idx, timestamp);
   if (!priors_added) {
     appPtr_->getLogger().error("GraphTimeCentricKimera: failed to add priors during bootstrap");
-    return 0;
+    return false;
   }
 
   first_state_priors_added_ = true;
   appPtr_->getLogger().info("GraphTimeCentricKimera: bootstrap initial state complete");
-  return state_idx;
+  out_state_idx = state_idx;
+  return true;
 }
 
 
