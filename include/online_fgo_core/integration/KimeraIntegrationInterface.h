@@ -27,10 +27,13 @@
 #include <string>
 
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/geometry/StereoPoint2.h>
+#include <gtsam/geometry/Cal3_S2Stereo.h>
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/base/Matrix.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/slam/SmartFactorParams.h>
 #include <Eigen/Dense>
 
 #include "online_fgo_core/graph/GraphTimeCentricKimera.h"
@@ -237,6 +240,42 @@ namespace fgo::integration {
     bool addImuFactorBetween(const StateHandle& previous_state,
                              const StateHandle& current_state,
                              std::shared_ptr<gtsam::PreintegrationType> pim);
+
+    // ========================================================================
+    // VISUAL FACTOR INTERFACE
+    // ========================================================================
+
+    /**
+     * @brief Stereo measurement type (matches Kimera's StereoMeasurement)
+     */
+    using LandmarkId = int64_t;
+    using FrameId = int64_t;
+    using StereoMeasurement = std::pair<LandmarkId, gtsam::StereoPoint2>;
+
+    /**
+     * @brief Set stereo camera calibration and smart factor params for visual factors
+     * @param stereo_cal Stereo camera calibration (K, baseline)
+     * @param B_Pose_leftCam Body to left camera pose transformation
+     * @param smart_noise Pre-initialized smart factor noise model (from VioBackend)
+     * @param smart_params Pre-initialized smart factor params (from VioBackend)
+     */
+    void setStereoCalibration(const gtsam::Cal3_S2Stereo::shared_ptr& stereo_cal,
+                              const gtsam::Pose3& B_Pose_leftCam,
+                              const gtsam::SharedNoiseModel& smart_noise,
+                              const gtsam::SmartProjectionParams& smart_params);
+
+    /**
+     * @brief Add stereo visual measurements for a keyframe
+     * 
+     * Processes stereo measurements and adds/updates SmartStereoFactors
+     * in the underlying graph.
+     * 
+     * @param frame_id Current keyframe ID
+     * @param stereo_measurements Vector of (landmark_id, stereo_point) pairs
+     * @return Number of landmarks added/updated
+     */
+    size_t addStereoMeasurements(FrameId frame_id,
+                                 const std::vector<StereoMeasurement>& stereo_measurements);
 
     // ========================================================================
     // FACTOR INSERTION (Future use for visual factors)

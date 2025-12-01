@@ -499,5 +499,41 @@ void KimeraIntegrationInterface::updateParameters(const KimeraIntegrationParams&
   }
 }
 
+// ========================================================================
+// VISUAL FACTOR INTERFACE
+// ========================================================================
+
+void KimeraIntegrationInterface::setStereoCalibration(
+    const gtsam::Cal3_S2Stereo::shared_ptr& stereo_cal,
+    const gtsam::Pose3& B_Pose_leftCam,
+    const gtsam::SharedNoiseModel& smart_noise,
+    const gtsam::SmartProjectionParams& smart_params) {
+  
+  if (!graph_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Graph not initialized, cannot set stereo calibration");
+    return;
+  }
+  
+  graph_->setStereoCalibration(stereo_cal, B_Pose_leftCam, smart_noise, smart_params);
+  app_->getLogger().info("KimeraIntegrationInterface: Stereo calibration and smart factor params set");
+}
+
+size_t KimeraIntegrationInterface::addStereoMeasurements(
+    FrameId frame_id,
+    const std::vector<StereoMeasurement>& stereo_measurements) {
+  
+  if (!initialized_ || !graph_) {
+    app_->getLogger().error("KimeraIntegrationInterface: Not initialized, cannot add stereo measurements");
+    return 0;
+  }
+  
+  size_t n_added = graph_->addStereoMeasurementsToGraph(frame_id, stereo_measurements);
+  
+  app_->getLogger().debug("KimeraIntegrationInterface: Added " + std::to_string(n_added) + 
+                          " stereo measurements at frame " + std::to_string(frame_id));
+  
+  return n_added;
+}
+
 
 } // namespace fgo::integration

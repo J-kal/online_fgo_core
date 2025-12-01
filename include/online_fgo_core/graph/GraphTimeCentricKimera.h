@@ -29,6 +29,10 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
+#include <gtsam/slam/SmartFactorParams.h>
+#include <gtsam/geometry/Cal3_S2Stereo.h>
+#include <gtsam/geometry/StereoPoint2.h>
+#include <gtsam_unstable/slam/SmartStereoProjectionPoseFactor.h>
 // PreintegrationType is defined in CombinedImuFactor.h, no separate header needed
 #include <gtsam/navigation/CombinedImuFactor.h>
 #include <mutex>
@@ -70,11 +74,18 @@ struct GraphTimeCentricKimeraParams {
   // GP motion prior configuration  
   bool addGPMotionPriors = true;           // Add GP priors between states
   
-  // Visual factor configuration (future)
-  bool enableSmartFactors = false;         // Enable smart factor management
+  // Visual factor configuration
+  bool enableSmartFactors = true;          // Enable smart factor management
   size_t smartFactorSlotReserve = 1000;    // Reserve slots for smart factors
   double cheiralityThreshold = 0.1;        // Minimum depth in meters
-  size_t minObservations = 3;              // Minimum observations for valid landmark
+  size_t minObservations = 2;              // Minimum observations for valid landmark
+  double smartFactorNoiseSigma = 1.5;      // Pixel noise sigma for smart factors
+  
+  // Smart factor parameters (from BackendParams)
+  double rankTolerance = 1.0;              // Rank tolerance for linear triangulation
+  double landmarkDistanceThreshold = 10.0; // Maximum landmark distance (m)
+  double retriangulationThreshold = 0.001; // Threshold to retriangulate
+  double outlierRejection = 3.0;           // Chi-squared outlier rejection threshold
   
   // Optimization
   bool optimizeOnKeyframe = true;          // Trigger optimization on keyframe arrival
@@ -121,10 +132,22 @@ public:
     typedef std::shared_ptr<GraphTimeCentricKimera> Ptr;
     
     // Type aliases for clarity
-    using LandmarkId = uint64_t;
+    using LandmarkId = int64_t;  // Match Kimera's LandmarkId type
+    using FrameId = int64_t;     // Match Kimera's FrameId type
     using LandmarkIdSet = std::set<LandmarkId>;
     using SmartFactorPtr = boost::shared_ptr<gtsam::SmartProjectionPoseFactor<gtsam::Cal3_S2>>;
+    using SmartStereoFactorPtr = boost::shared_ptr<gtsam::SmartStereoProjectionPoseFactor>;
     using LandmarkIdSmartFactorMap = std::map<LandmarkId, SmartFactorPtr>;
+    using LandmarkIdSmartStereoFactorMap = std::map<LandmarkId, SmartStereoFactorPtr>;
+    
+    // Slot type for factor graph slot tracking (-1 means not yet in graph)
+    using Slot = int64_t;
+    
+    // Feature track: vector of (frame_id, stereo_measurement)
+    struct StereoFeatureTrack {
+        std::vector<std::pair<FrameId, gtsam::StereoPoint2>> observations;
+        bool in_ba_graph = false;  // True if factor already in graph
+    };
     
     // Feature track: vector of (camera_pose_key, pixel_measurement)
     struct FeatureTrack {
@@ -132,6 +155,9 @@ public:
         gtsam::Point3 world_position;  // Optional 3D position estimate
         bool has_3d_estimate = false;
     };
+    
+    // Stereo measurement type (matches Kimera)
+    using StereoMeasurement = std::pair<LandmarkId, gtsam::StereoPoint2>;
 
     /**
      * @brief Construct Kimera integration graph
@@ -491,6 +517,89 @@ public:
     std::map<std::string, size_t> getLandmarkStatistics() const;
 
     // ========================================================================
+    // STEREO VISUAL FACTOR INTERFACE (mirrors VioBackend)
+    // ========================================================================
+
+    /**
+     * @brief Set stereo camera calibration and smart factor params
+     * @param stereo_cal Stereo camera calibration (K, baseline)
+     * @param B_Pose_leftCam Body to left camera pose transformation
+     * @param smart_noise Pre-initialized smart factor noise model (from VioBackend)
+     * @param smart_params Pre-initialized smart factor params (from VioBackend)
+     * 
+     * Note: smart_noise and smart_params are passed from VioBackend, which initializes
+     * them from BackendParams.yaml. This ensures the same parameters are used as
+     * the standard VioBackend path.
+     */
+    void setStereoCalibration(const gtsam::Cal3_S2Stereo::shared_ptr& stereo_cal,
+                              const gtsam::Pose3& B_Pose_leftCam,
+                              const gtsam::SharedNoiseModel& smart_noise,
+                              const gtsam::SmartProjectionParams& smart_params);
+
+    /**
+     * @brief Add stereo measurements to feature tracks and update factors
+     * 
+     * This is the main entry point for adding visual measurements from Kimera.
+     * It mirrors VioBackend::addStereoMeasurementsToFeatureTracks + addLandmarksToGraph.
+     * 
+     * @param frame_id Current keyframe ID
+     * @param stereo_measurements Vector of (landmark_id, stereo_point) pairs
+     * @return Number of smart factors added/updated
+     */
+    size_t addStereoMeasurementsToGraph(
+        FrameId frame_id,
+        const std::vector<StereoMeasurement>& stereo_measurements);
+
+    /**
+     * @brief Add a new stereo landmark to the graph
+     * @param lmk_id Landmark ID
+     * @param track Feature track with stereo observations
+     * @return true if successfully added
+     */
+    bool addStereoLandmarkToGraph(const LandmarkId& lmk_id,
+                                  const StereoFeatureTrack& track);
+
+    /**
+     * @brief Update existing stereo landmark with new observation
+     * @param lmk_id Landmark ID
+     * @param frame_id Frame ID of new observation
+     * @param measurement Stereo pixel measurement
+     * @return true if successfully updated
+     */
+    bool updateStereoLandmarkInGraph(const LandmarkId& lmk_id,
+                                     FrameId frame_id,
+                                     const gtsam::StereoPoint2& measurement);
+
+    /**
+     * @brief Get all smart stereo factors for external smoother
+     * @return Map of landmark IDs to smart stereo factors
+     */
+    const LandmarkIdSmartStereoFactorMap& getNewSmartStereoFactors() const {
+        return new_smart_stereo_factors_;
+    }
+
+    /**
+     * @brief Clear new smart factors after they've been consumed
+     */
+    void clearNewSmartStereoFactors() {
+        new_smart_stereo_factors_.clear();
+    }
+
+    /**
+     * @brief Delete slots for smart factors that need updating
+     * @return Vector of factor slots to delete from smoother
+     */
+    std::vector<Slot> getSmartFactorSlotsToDelete() const;
+
+    /**
+     * @brief Update slot tracking after smoother update
+     * @param lmk_ids Landmark IDs of factors added to smoother
+     * @param factor_slots New slot indices assigned by smoother
+     */
+    void updateSmartFactorSlots(const std::vector<LandmarkId>& lmk_ids,
+                                const std::vector<Slot>& factor_slots);
+
+    // ========================================================================
     // PARAMETERS AND CONFIGURATION
     // ========================================================================
 
@@ -556,6 +665,22 @@ protected:
     
     // Smart factors already in the graph
     LandmarkIdSmartFactorMap old_smart_factors_;
+    
+    // Stereo smart factors (mirrors VioBackend structure)
+    LandmarkIdSmartStereoFactorMap new_smart_stereo_factors_;
+    // old_smart_stereo_factors_ stores (factor, slot) pairs where slot=-1 means not yet in graph
+    std::map<LandmarkId, std::pair<SmartStereoFactorPtr, Slot>> old_smart_stereo_factors_;
+    
+    // Feature tracks (mirrors VioBackend::feature_tracks_)
+    std::map<LandmarkId, StereoFeatureTrack> stereo_feature_tracks_;
+    
+    // Stereo camera calibration
+    gtsam::Cal3_S2Stereo::shared_ptr stereo_cal_;
+    gtsam::Pose3 B_Pose_leftCam_;  // Body to left camera transformation
+    
+    // Smart factor parameters (initialized from kimeraParams_)
+    gtsam::SharedNoiseModel smart_noise_;
+    gtsam::SmartProjectionParams smart_stereo_params_;  // SmartStereoProjectionParams is alias for SmartProjectionParams
     
     // Landmark counter for generating internal IDs
     std::atomic<uint64_t> landmark_count_{0};

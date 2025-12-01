@@ -24,6 +24,7 @@
 #include <gtsam/inference/Key.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam_unstable/slam/SmartStereoProjectionPoseFactor.h>
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -977,6 +978,211 @@ GraphTimeCentricKimera::SmartFactorPtr GraphTimeCentricKimera::createSmartFactor
     const FeatureTrack& track) const {
   // TODO: Implement in Phase 3
   return nullptr;
+}
+
+// ============================================================================
+// STEREO VISUAL FACTOR IMPLEMENTATION
+// ============================================================================
+
+void GraphTimeCentricKimera::setStereoCalibration(
+    const gtsam::Cal3_S2Stereo::shared_ptr& stereo_cal,
+    const gtsam::Pose3& B_Pose_leftCam,
+    const gtsam::SharedNoiseModel& smart_noise,
+    const gtsam::SmartProjectionParams& smart_params) {
+  stereo_cal_ = stereo_cal;
+  B_Pose_leftCam_ = B_Pose_leftCam;
+  
+  // Use pre-initialized smart factor params from VioBackend
+  // This ensures the same parameters as the standard VioBackend path
+  // (initialized from BackendParams.yaml via setFactorsParams)
+  smart_noise_ = smart_noise;
+  smart_stereo_params_ = smart_params;
+  
+  appPtr_->getLogger().info("GraphTimeCentricKimera: Stereo calibration set - baseline: " + 
+                            std::to_string(stereo_cal->baseline()) +
+                            " (using pre-initialized smart factor params from VioBackend)");
+}
+
+size_t GraphTimeCentricKimera::addStereoMeasurementsToGraph(
+    FrameId frame_id,
+    const std::vector<StereoMeasurement>& stereo_measurements) {
+  
+  if (!stereo_cal_) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Stereo calibration not set, cannot add visual factors");
+    return 0;
+  }
+  
+  size_t n_new_landmarks = 0;
+  size_t n_updated_landmarks = 0;
+  
+  for (const auto& meas : stereo_measurements) {
+    const LandmarkId lmk_id = meas.first;
+    const gtsam::StereoPoint2& stereo_px = meas.second;
+    
+    // Check if we have an existing track for this landmark
+    auto track_it = stereo_feature_tracks_.find(lmk_id);
+    
+    if (track_it == stereo_feature_tracks_.end()) {
+      // New landmark - create feature track
+      StereoFeatureTrack new_track;
+      new_track.observations.emplace_back(frame_id, stereo_px);
+      new_track.in_ba_graph = false;
+      stereo_feature_tracks_[lmk_id] = new_track;
+    } else {
+      // Existing landmark - add observation
+      track_it->second.observations.emplace_back(frame_id, stereo_px);
+    }
+  }
+  
+  // Now add/update landmarks in graph (mirrors VioBackend::addLandmarksToGraph)
+  for (const auto& meas : stereo_measurements) {
+    const LandmarkId lmk_id = meas.first;
+    auto track_it = stereo_feature_tracks_.find(lmk_id);
+    
+    if (track_it == stereo_feature_tracks_.end()) continue;
+    
+    StereoFeatureTrack& ft = track_it->second;
+    
+    // Only add tracks with >= minObservations (default 2)
+    if (ft.observations.size() < kimeraParams_.minObservations) {
+      continue;
+    }
+    
+    if (!ft.in_ba_graph) {
+      // New landmark - add to graph
+      ft.in_ba_graph = true;
+      if (addStereoLandmarkToGraph(lmk_id, ft)) {
+        ++n_new_landmarks;
+      }
+    } else {
+      // Update existing landmark with new observation
+      const auto& last_obs = ft.observations.back();
+      if (updateStereoLandmarkInGraph(lmk_id, last_obs.first, last_obs.second)) {
+        ++n_updated_landmarks;
+      }
+    }
+  }
+  
+  appPtr_->getLogger().debug("GraphTimeCentricKimera: Added " + std::to_string(n_new_landmarks) +
+                             " new landmarks, updated " + std::to_string(n_updated_landmarks) + 
+                             " landmarks at frame " + std::to_string(frame_id));
+  
+  return n_new_landmarks + n_updated_landmarks;
+}
+
+bool GraphTimeCentricKimera::addStereoLandmarkToGraph(
+    const LandmarkId& lmk_id,
+    const StereoFeatureTrack& track) {
+  
+  try {
+    // Create new SmartStereoFactor (mirrors VioBackend::addLandmarkToGraph)
+    SmartStereoFactorPtr new_factor = boost::make_shared<gtsam::SmartStereoProjectionPoseFactor>(
+        smart_noise_, smart_stereo_params_, B_Pose_leftCam_);
+    
+    // Add all observations to the factor
+    for (const auto& obs : track.observations) {
+      const FrameId& frame_id = obs.first;
+      const gtsam::StereoPoint2& measurement = obs.second;
+      const gtsam::Symbol pose_symbol('x', frame_id);
+      new_factor->add(measurement, pose_symbol, stereo_cal_);
+    }
+    
+    // Store in new smart factors (to be added to graph during optimization)
+    new_smart_stereo_factors_[lmk_id] = new_factor;
+    
+    // Also store in old_smart_stereo_factors_ with slot = -1 (not yet in graph)
+    old_smart_stereo_factors_[lmk_id] = std::make_pair(new_factor, -1);
+    
+    // Add factor to incremental update
+    this->push_back(new_factor);
+    new_factors_since_last_opt_.push_back(new_factor);
+    
+    return true;
+    
+  } catch (const std::exception& e) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception adding stereo landmark " + 
+                               std::to_string(lmk_id) + ": " + std::string(e.what()));
+    return false;
+  }
+}
+
+bool GraphTimeCentricKimera::updateStereoLandmarkInGraph(
+    const LandmarkId& lmk_id,
+    FrameId frame_id,
+    const gtsam::StereoPoint2& measurement) {
+  
+  try {
+    // Find existing factor
+    auto old_it = old_smart_stereo_factors_.find(lmk_id);
+    if (old_it == old_smart_stereo_factors_.end()) {
+      appPtr_->getLogger().error("GraphTimeCentricKimera: Landmark " + std::to_string(lmk_id) + 
+                                 " not found in old_smart_stereo_factors_");
+      return false;
+    }
+    
+    const SmartStereoFactorPtr& old_factor = old_it->second.first;
+    Slot slot = old_it->second.second;
+    
+    // Clone old factor and add new observation (mirrors VioBackend::updateLandmarkInGraph)
+    SmartStereoFactorPtr new_factor = boost::make_shared<gtsam::SmartStereoProjectionPoseFactor>(*old_factor);
+    
+    const gtsam::Symbol pose_symbol('x', frame_id);
+    new_factor->add(measurement, pose_symbol, stereo_cal_);
+    
+    // Store updated factor
+    new_smart_stereo_factors_[lmk_id] = new_factor;
+    old_it->second.first = new_factor;
+    
+    // Add factor to incremental update
+    // Note: slot management for update/delete is handled by the external smoother
+    this->push_back(new_factor);
+    new_factors_since_last_opt_.push_back(new_factor);
+    
+    return true;
+    
+  } catch (const std::exception& e) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Exception updating stereo landmark " + 
+                               std::to_string(lmk_id) + ": " + std::string(e.what()));
+    return false;
+  }
+}
+
+std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactorSlotsToDelete() const {
+  std::vector<Slot> slots_to_delete;
+  
+  // For each new smart factor, if it has an existing slot (!= -1), mark for deletion
+  for (const auto& new_sf : new_smart_stereo_factors_) {
+    const LandmarkId lmk_id = new_sf.first;
+    auto old_it = old_smart_stereo_factors_.find(lmk_id);
+    if (old_it != old_smart_stereo_factors_.end()) {
+      Slot slot = old_it->second.second;
+      if (slot != -1) {
+        slots_to_delete.push_back(slot);
+      }
+    }
+  }
+  
+  return slots_to_delete;
+}
+
+void GraphTimeCentricKimera::updateSmartFactorSlots(
+    const std::vector<LandmarkId>& lmk_ids,
+    const std::vector<Slot>& factor_slots) {
+  
+  if (lmk_ids.size() != factor_slots.size()) {
+    appPtr_->getLogger().error("GraphTimeCentricKimera: Mismatch between lmk_ids and factor_slots size");
+    return;
+  }
+  
+  for (size_t i = 0; i < lmk_ids.size(); ++i) {
+    const LandmarkId& lmk_id = lmk_ids[i];
+    const Slot& slot = factor_slots[i];
+    
+    auto it = old_smart_stereo_factors_.find(lmk_id);
+    if (it != old_smart_stereo_factors_.end()) {
+      it->second.second = slot;
+    }
+  }
 }
 
 } // namespace fgo::graph
