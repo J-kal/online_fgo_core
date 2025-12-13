@@ -735,13 +735,6 @@ bool GraphTimeCentricKimera::addExternalFactor(
   // Add factor to graph
   this->push_back(factor);
   
-  // Update relatedKeys_ to prevent premature marginalization
-  for (size_t idx : state_indices) {
-    relatedKeys_.push_back(X(idx));
-    relatedKeys_.push_back(V(idx));
-    relatedKeys_.push_back(B(idx));
-  }
-  
   appPtr_->getLogger().debug("GraphTimeCentricKimera: Added external factor connecting " + 
                              std::to_string(state_indices.size()) + " states");
   
@@ -751,7 +744,9 @@ bool GraphTimeCentricKimera::addExternalFactor(
 bool GraphTimeCentricKimera::buildIncrementalUpdate(
     gtsam::NonlinearFactorGraph* new_factors,
     gtsam::Values* new_values,
-    fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps) {
+    fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps,
+    gtsam::FactorIndices* delete_slots,
+    std::vector<LandmarkId>* new_smart_factor_lmk_ids) {
   
   if (!new_factors || !new_values || !new_timestamps) {
     appPtr_->getLogger().warn(
@@ -765,6 +760,14 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
   new_factors->resize(0);
   new_values->clear();
   new_timestamps->clear();
+  
+  // Clear optional outputs if provided
+  if (delete_slots) {
+    delete_slots->clear();
+  }
+  if (new_smart_factor_lmk_ids) {
+    new_smart_factor_lmk_ids->clear();
+  }
 
   // Debug current graph / value state before deciding what to return.
   appPtr_->getLogger().info(
@@ -786,73 +789,270 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     return false;
   }
 
-  *new_factors = new_factors_since_last_opt_;
+  // CRITICAL: SmartFactors MUST be FIRST in new_factors for correct slot mapping
+  // This mirrors VioBackend::optimize() which adds SmartFactors first, then IMU/priors
+  // The slot tracking in GraphTimeCentricBackendAdapter relies on this ordering
+  
+  // Step 1: Add SmartFactors first, tracking their landmark IDs in order
+  if (new_smart_factor_lmk_ids) {
+    new_smart_factor_lmk_ids->clear();
+  }
+  
+  for (const auto& [lmk_id, factor_ptr] : new_smart_stereo_factors_) {
+    new_factors->push_back(factor_ptr);
+    if (new_smart_factor_lmk_ids) {
+      new_smart_factor_lmk_ids->push_back(lmk_id);
+    }
+  }
+  
+  // Step 2: Add all other factors (IMU, priors, etc.) after SmartFactors
+  for (const auto& factor : new_factors_since_last_opt_) {
+    // Skip SmartStereoProjectionPoseFactors since they're already added above
+    // Check if this is a SmartStereoProjectionPoseFactor by attempting dynamic cast
+    if (boost::dynamic_pointer_cast<gtsam::SmartStereoProjectionPoseFactor>(factor)) {
+      continue;  // Already added in Step 1
+    }
+    new_factors->push_back(factor);
+  }
+  
+  appPtr_->getLogger().info(
+      "GraphTimeCentricKimera::buildIncrementalUpdate: reordered factors - " +
+      std::to_string(new_smart_stereo_factors_.size()) + " SmartFactors first, then " +
+      std::to_string(new_factors->size() - new_smart_stereo_factors_.size()) + " other factors");
+
   *new_values = new_values_since_last_opt_;
 
   for (const auto& [key, timestamp] : new_key_timestamps_since_last_opt_) {
     (*new_timestamps)[key] = timestamp;
   }
+  
+  // Populate delete_slots with SmartFactor slots that need to be replaced
+  if (delete_slots) {
+    auto slots_to_delete = getSmartFactorSlotsToDelete();
+    *delete_slots = gtsam::FactorIndices(slots_to_delete.begin(), slots_to_delete.end());
+    
+    if (!delete_slots->empty()) {
+      appPtr_->getLogger().info(
+          "GraphTimeCentricKimera::buildIncrementalUpdate: " +
+          std::to_string(delete_slots->size()) + " SmartFactor slots to delete");
+    }
+  }
 
   return true;
+}
+
+std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactorSlotsToDelete() {
+  std::vector<Slot> slots_to_delete;
+  slots_to_delete.reserve(new_smart_stereo_factors_.size());
+
+  // Mirrors VioBackend::optimize():
+  // For each updated smart factor, delete the slot of the old factor if it still
+  // exists in the smoother graph. If it no longer exists, it was marginalized out
+  // and we should drop it from tracking without deleting anything.
+  for (const auto& [lmk_id, /*new_factor*/ _] : new_smart_stereo_factors_) {
+    (void)_;  // unused
+    auto old_it = old_smart_stereo_factors_.find(lmk_id);
+    if (old_it == old_smart_stereo_factors_.end()) {
+      continue;
+    }
+
+    const Slot slot = old_it->second.second;
+    if (slot == -1) {
+      continue;
+    }
+
+    // SAFETY: only delete if factor still exists in the current graph.
+    // If it doesn't, it was already marginalized out.
+    const size_t slot_idx = static_cast<size_t>(slot);
+    const bool slot_exists = (slot_idx < this->size()) && (this->at(slot_idx) != nullptr);
+    if (slot_exists) {
+      slots_to_delete.push_back(slot);
+    } else {
+      // Clean tracking entry; the factor is gone.
+      old_smart_stereo_factors_.erase(old_it);
+    }
+  }
+
+  return slots_to_delete;
 }
 
 void GraphTimeCentricKimera::finalizeIncrementalUpdate() {
   new_factors_since_last_opt_.resize(0);
   new_values_since_last_opt_.clear();
   new_key_timestamps_since_last_opt_.clear();
+  // Clear new_smart_stereo_factors_ as they've been added to the graph
+  // The old_smart_stereo_factors_ still tracks them with their slot numbers
+  new_smart_stereo_factors_.clear();
 }
 
 // ========================================================================
-// SMART FACTOR MANAGEMENT (Stubs for future implementation)
+// SMART FACTOR MANAGEMENT
 // ========================================================================
 
-bool GraphTimeCentricKimera::addLandmarkToGraph(const LandmarkId& lm_id, const FeatureTrack& track) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: addLandmarkToGraph not yet implemented");
-  return false;
+namespace {
+// Remove any factors containing a specific key from a factor graph.
+static void deleteAllFactorsWithKey(const gtsam::Key& key,
+                                    const gtsam::NonlinearFactorGraph& in,
+                                    gtsam::NonlinearFactorGraph* out) {
+  if (!out) {
+    return;
+  }
+  out->resize(0);
+  out->reserve(in.size());
+  for (const auto& f : in) {
+    if (!f) {
+      continue;
+    }
+    const auto& keys = f->keys();
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+      out->push_back(f);
+    }
+  }
 }
 
-size_t GraphTimeCentricKimera::addLandmarksToGraph(
-    const LandmarkIdSet& landmarks, 
-    const std::map<LandmarkId, FeatureTrack>& tracks) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: addLandmarksToGraph not yet implemented");
-  return 0;
+static bool deleteKeyFromValues(const gtsam::Key& key,
+                                const gtsam::Values& in,
+                                gtsam::Values* out) {
+  if (!out) {
+    return false;
+  }
+  out->clear();
+  bool deleted = false;
+  for (const auto& kv : in) {
+    if (kv.key == key) {
+      deleted = true;
+      continue;
+    }
+    out->insert(kv.key, kv.value);
+  }
+  return deleted;
 }
 
-bool GraphTimeCentricKimera::updateLandmarkInGraph(const LandmarkId& lm_id, const FeatureTrack& track) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: updateLandmarkInGraph not yet implemented");
-  return false;
+static bool deleteKeyFromTimestamps(const gtsam::Key& key,
+                                    const fgo::solvers::FixedLagSmoother::KeyTimestampMap& in,
+                                    fgo::solvers::FixedLagSmoother::KeyTimestampMap* out) {
+  if (!out) {
+    return false;
+  }
+  out->clear();
+  bool deleted = false;
+  for (const auto& [k, ts] : in) {
+    if (k == key) {
+      deleted = true;
+      continue;
+    }
+    (*out)[k] = ts;
+  }
+  return deleted;
 }
 
-size_t GraphTimeCentricKimera::cleanCheiralityLandmarks(const gtsam::Values& current_values) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: cleanCheiralityLandmarks not yet implemented");
-  return 0;
+static void findSlotsOfFactorsWithKey(const gtsam::Key& key,
+                                      const gtsam::NonlinearFactorGraph& graph,
+                                      std::vector<size_t>* slots) {
+  if (!slots) {
+    return;
+  }
+  slots->clear();
+  for (size_t i = 0; i < graph.size(); ++i) {
+    if (!graph[i]) {
+      continue;
+    }
+    const auto& keys = graph[i]->keys();
+    if (std::find(keys.begin(), keys.end(), key) != keys.end()) {
+      slots->push_back(i);
+    }
+  }
 }
+}  // namespace
 
-void GraphTimeCentricKimera::updateSmartFactorSlots(
-    LandmarkIdSmartFactorMap& new_factors,
-    const gtsam::KeyVector& marginalized_keys) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: updateSmartFactorSlots not yet implemented");
-}
+size_t GraphTimeCentricKimera::cleanCheiralityLandmarks(
+    const gtsam::Symbol& lmk_symbol,
+    const gtsam::NonlinearFactorGraph& graph_in_smoother,
+    const gtsam::NonlinearFactorGraph& new_factors,
+    const gtsam::Values& new_values,
+    const fgo::solvers::FixedLagSmoother::KeyTimestampMap& new_timestamps,
+    const gtsam::FactorIndices& delete_slots,
+    gtsam::NonlinearFactorGraph* new_factors_out,
+    gtsam::Values* new_values_out,
+    fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps_out,
+    gtsam::FactorIndices* delete_slots_out) {
+  if (!new_factors_out || !new_values_out || !new_timestamps_out || !delete_slots_out) {
+    appPtr_->getLogger().error(
+        "GraphTimeCentricKimera::cleanCheiralityLandmarks: null output args");
+    return 0;
+  }
 
-GraphTimeCentricKimera::LandmarkIdSet GraphTimeCentricKimera::getTrackedLandmarks() const {
-  // TODO: Implement in Phase 3
-  return LandmarkIdSet();
+  // Kimera-VIO uses point landmarks with symbol 'l'. For smart factors we track by LandmarkId.
+  // In this integration, the lmk id is carried in the symbol index.
+  const LandmarkId lmk_id = static_cast<LandmarkId>(lmk_symbol.index());
+  const gtsam::Key lmk_key = lmk_symbol.key();
+
+  // 1) Remove any pending new factors that reference this landmark key (if any).
+  // (In our current GTC integration, we do not insert landmark values, but we still
+  //  apply the same “remove from new_factors/new_values/new_timestamps” pattern.)
+  deleteAllFactorsWithKey(lmk_key, new_factors, new_factors_out);
+
+  // 2) Remove key from new values/timestamps if present.
+  gtsam::Values tmp_values;
+  bool deleted_values = deleteKeyFromValues(lmk_key, new_values, &tmp_values);
+  *new_values_out = tmp_values;
+
+  fgo::solvers::FixedLagSmoother::KeyTimestampMap tmp_ts;
+  bool deleted_ts = deleteKeyFromTimestamps(lmk_key, new_timestamps, &tmp_ts);
+  *new_timestamps_out = tmp_ts;
+
+  // Match VioBackend invariant: if removed from values, removed from timestamps too.
+  if (deleted_values != deleted_ts) {
+    appPtr_->getLogger().warn(
+        "GraphTimeCentricKimera::cleanCheiralityLandmarks: inconsistent deletion for key " +
+        std::string(1, lmk_symbol.chr()) + std::to_string(lmk_symbol.index()));
+  }
+
+  // 3) Delete from current (smoother) graph all factors that touch this key.
+  *delete_slots_out = delete_slots;
+  std::vector<size_t> extra_slots;
+  findSlotsOfFactorsWithKey(lmk_key, graph_in_smoother, &extra_slots);
+  delete_slots_out->insert(delete_slots_out->end(), extra_slots.begin(), extra_slots.end());
+
+  // 4) Bookkeeping: remove from our smart-factor tracking.
+  removeLandmark(lmk_id);
+
+  appPtr_->getLogger().warn(
+      "GraphTimeCentricKimera::cleanCheiralityLandmarks: removed landmark " +
+      std::to_string(lmk_id) + " (symbol=" + std::string(1, lmk_symbol.chr()) +
+      std::to_string(lmk_symbol.index()) + "), extra_delete_slots=" +
+      std::to_string(extra_slots.size()));
+
+  return 1;
 }
 
 bool GraphTimeCentricKimera::removeLandmark(const LandmarkId& lm_id) {
-  // TODO: Implement in Phase 3
-  appPtr_->getLogger().warn("GraphTimeCentricKimera: removeLandmark not yet implemented");
-  return false;
-}
+  std::lock_guard<std::mutex> lock(landmark_mutex_);
+  bool removed_any = false;
 
-std::map<std::string, size_t> GraphTimeCentricKimera::getLandmarkStatistics() const {
-  // TODO: Implement in Phase 3
-  return std::map<std::string, size_t>();
+  // Remove feature track.
+  auto ft_it = stereo_feature_tracks_.find(lm_id);
+  if (ft_it != stereo_feature_tracks_.end()) {
+    stereo_feature_tracks_.erase(ft_it);
+    removed_any = true;
+  }
+
+  // Remove factor tracking.
+  new_smart_stereo_factors_.erase(lm_id);
+  auto old_it = old_smart_stereo_factors_.find(lm_id);
+  if (old_it != old_smart_stereo_factors_.end()) {
+    old_smart_stereo_factors_.erase(old_it);
+    removed_any = true;
+  }
+
+  // Remove legacy maps if used.
+  new_smart_factors_.erase(lm_id);
+  old_smart_factors_.erase(lm_id);
+
+  // Remove id mapping if present.
+  kimera_to_plugin_id_.erase(lm_id);
+
+  return removed_any;
 }
 
 // ========================================================================
@@ -911,7 +1111,7 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
     currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
     
         // GP FACTORS - COMMENTED OUT FOR IMU ISOLATION TESTING
-        /*
+        
         // If GP factors enabled, also insert omega and acc keys
         if (kimeraParams_.addGPMotionPriors) {
           gtsam::Key omega_key = W(state_idx);
@@ -926,8 +1126,7 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
           }
           values_.insert(acc_key, acc);
           keyTimestampMap_[acc_key] = timestamp;
-        }
-        */    
+        }    
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " +
                                std::to_string(state_idx) + " at timestamp " +
                                std::to_string(timestamp));
@@ -1308,21 +1507,38 @@ bool GraphTimeCentricKimera::updateStereoLandmarkInGraph(
     const SmartStereoFactorPtr& old_factor = old_it->second.first;
     Slot slot = old_it->second.second;
     
+    // CRITICAL CHECK (mirrors VioBackend::updateLandmarkInGraph):
+    // If slot == -1, the factor hasn't been integrated into the graph yet.
+    // This should not happen in normal operation - updateLandmark should only
+    // be called for landmarks that are already in_ba_graph (which means their
+    // factor has been added and slot assigned).
+    if (slot == -1) {
+      appPtr_->getLogger().error(
+          "GraphTimeCentricKimera: Attempting to update landmark " + 
+          std::to_string(lmk_id) + " but slot is -1 (factor not yet in graph). "
+          "This indicates a logic error - updateStereoLandmarkInGraph should only "
+          "be called for landmarks already integrated into the graph.");
+      // Don't fatal like VioBackend, but log error and return false
+      return false;
+    }
+    
     // Clone old factor and add new observation (mirrors VioBackend::updateLandmarkInGraph)
     SmartStereoFactorPtr new_factor = boost::make_shared<gtsam::SmartStereoProjectionPoseFactor>(*old_factor);
     
     const gtsam::Symbol pose_symbol('x', frame_id);
     new_factor->add(measurement, pose_symbol, stereo_cal_);
     
-    // Store updated factor
+    // Store updated factor in new_smart_stereo_factors_ (to be added in this optimization cycle)
+    // This triggers slot deletion of old factor and addition of new factor
     new_smart_stereo_factors_[lmk_id] = new_factor;
+    
+    // Update old_smart_stereo_factors_ to point to new factor (slot will be updated after optimization)
     old_it->second.first = new_factor;
     
-    // Add factor to incremental update
-    // Note: slot management for update/delete is handled by the external smoother
+    // Add factor to incremental update (separate tracking for non-SmartFactors)
+    // Note: SmartFactors are added separately via new_smart_stereo_factors_
     this->push_back(new_factor);
     new_factors_since_last_opt_.push_back(new_factor);
-    
     return true;
     
   } catch (const std::exception& e) {
@@ -1330,24 +1546,6 @@ bool GraphTimeCentricKimera::updateStereoLandmarkInGraph(
                                std::to_string(lmk_id) + ": " + std::string(e.what()));
     return false;
   }
-}
-
-std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactorSlotsToDelete() const {
-  std::vector<Slot> slots_to_delete;
-  
-  // For each new smart factor, if it has an existing slot (!= -1), mark for deletion
-  for (const auto& new_sf : new_smart_stereo_factors_) {
-    const LandmarkId lmk_id = new_sf.first;
-    auto old_it = old_smart_stereo_factors_.find(lmk_id);
-    if (old_it != old_smart_stereo_factors_.end()) {
-      Slot slot = old_it->second.second;
-      if (slot != -1) {
-        slots_to_delete.push_back(slot);
-      }
-    }
-  }
-  
-  return slots_to_delete;
 }
 
 void GraphTimeCentricKimera::updateSmartFactorSlots(
@@ -1359,15 +1557,27 @@ void GraphTimeCentricKimera::updateSmartFactorSlots(
     return;
   }
   
+  // Update slot tracking for SmartFactors (mirrors VioBackend::updateNewSmartFactorsSlots)
   for (size_t i = 0; i < lmk_ids.size(); ++i) {
     const LandmarkId& lmk_id = lmk_ids[i];
     const Slot& slot = factor_slots[i];
     
     auto it = old_smart_stereo_factors_.find(lmk_id);
     if (it != old_smart_stereo_factors_.end()) {
+      // Update the slot number so it can be deleted on next update
       it->second.second = slot;
+      
+      
+    } else {
+      appPtr_->getLogger().warn(
+          "GraphTimeCentricKimera: Landmark " + std::to_string(lmk_id) + 
+          " not found in old_smart_stereo_factors_ during slot update");
     }
   }
+  
+  appPtr_->getLogger().info(
+      "GraphTimeCentricKimera: Updated slots for " + 
+      std::to_string(lmk_ids.size()) + " SmartFactors");
 }
 
 bool GraphTimeCentricKimera::getCurrentGraphAndValues(

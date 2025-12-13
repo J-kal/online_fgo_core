@@ -26,6 +26,14 @@
 
 #include "online_fgo_core/graph/GraphTimeCentric.h"
 #include "online_fgo_core/solver/FixedLagSmoother.h"
+#include "online_fgo_core/data/DataTypesFGO.h"
+
+#include <atomic>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
@@ -35,6 +43,7 @@
 #include <gtsam_unstable/slam/SmartStereoProjectionPoseFactor.h>
 // PreintegrationType is defined in CombinedImuFactor.h, no separate header needed
 #include <gtsam/navigation/CombinedImuFactor.h>
+#include <boost/shared_ptr.hpp>
 #include <mutex>
 #include <map>
 #include <unordered_map>
@@ -410,7 +419,6 @@ public:
      * 
      * NOTE: This is for future smart factor integration
      * TODO: Validate state indices exist in graph
-     * TODO: Update relatedKeys_ to prevent premature marginalization
      * TODO: Add factor to graph via push_back()
      */
     bool addExternalFactor(
@@ -433,7 +441,6 @@ public:
      * @param new_state Output state after optimization
      * @return Optimization time in seconds
      * 
-     * TODO: Ensure external factors in relatedKeys_ are handled
      * TODO: Update Kimera-specific state tracking (landmarks, etc.)
      */
     /**
@@ -447,11 +454,15 @@ public:
      *        incremental factors.
      * @param new_values Output values containing only the newly created keys.
      * @param new_timestamps Output timestamp map for the new keys.
+     * @param delete_slots Output vector of factor slots to delete (for SmartFactor updates).
+     * @param new_smart_factor_lmk_ids Output vector of landmark IDs for new SmartFactors (for slot tracking).
      * @return true if there is new information to optimize.
      */
     bool buildIncrementalUpdate(gtsam::NonlinearFactorGraph* new_factors,
                                 gtsam::Values* new_values,
-                                fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps);
+                                fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps,
+                                gtsam::FactorIndices* delete_slots = nullptr,
+                                std::vector<LandmarkId>* new_smart_factor_lmk_ids = nullptr);
 
     /**
      * @brief Mark the current incremental update as consumed.
@@ -470,72 +481,25 @@ public:
     // ========================================================================
 
     /**
-     * @brief Add a new landmark to the graph as a smart factor
-     * @param lm_id Unique landmark identifier from Kimera
-     * @param track Feature observations across multiple frames
-     * @return true if landmark was successfully added
-     * 
-     * TODO: Port from VioBackend::addLandmarksToGraph
-     * TODO: Create SmartProjectionPoseFactor for the track
-     * TODO: Add factor to graph and update tracking structures
+     * @brief Remove a cheirality-failing landmark and build a retry update.
+     *
+     * Mirrors Kimera-VIO's VioBackend::cleanCheiralityLmk():
+     * - Removes factors touching the failing landmark key from the pending update
+     * - Adds delete slots for any factors in the smoother graph touching that key
+     * - Removes landmark from local tracking (feature tracks + smart-factor maps)
+     *
+     * @return Number of landmarks removed (0 or 1).
      */
-    bool addLandmarkToGraph(const LandmarkId& lm_id, const FeatureTrack& track);
-
-    /**
-     * @brief Add multiple landmarks to the graph
-     * @param landmarks Set of landmark IDs to add
-     * @param tracks Map of landmark IDs to feature tracks
-     * @return Number of landmarks successfully added
-     * 
-     * TODO: Batch add landmarks with error handling
-     */
-    size_t addLandmarksToGraph(const LandmarkIdSet& landmarks, 
-                               const std::map<LandmarkId, FeatureTrack>& tracks);
-
-    /**
-     * @brief Update existing landmark with new observations
-     * @param lm_id Landmark to update
-     * @param track Updated feature track
-     * @return true if landmark was successfully updated
-     * 
-     * TODO: Update smart factor observations
-     */
-    bool updateLandmarkInGraph(const LandmarkId& lm_id, const FeatureTrack& track);
-
-    /**
-     * @brief Remove landmarks that fail cheirality check
-     * 
-     * Removes landmarks that are behind the camera or have invalid depth.
-     * 
-     * @param current_values Current factor graph values
-     * @return Number of landmarks removed
-     * 
-     * TODO: Port from VioBackend::cleanCheiralityLmk
-     * TODO: Check landmark depth and cheirality constraint
-     * TODO: Remove invalid factors from graph
-     */
-    size_t cleanCheiralityLandmarks(const gtsam::Values& current_values);
-
-    /**
-     * @brief Update smart factor observation slots
-     * 
-     * Manages the mapping between camera pose keys and observation slots
-     * in smart factors.
-     * 
-     * @param new_factors Smart factors to update
-     * @param marginalized_keys Keys that have been marginalized
-     * 
-     * TODO: Port from VioBackend::updateNewSmartFactorsSlots
-     * TODO: Handle slot reassignment after marginalization
-     */
-    void updateSmartFactorSlots(LandmarkIdSmartFactorMap& new_factors,
-                                const gtsam::KeyVector& marginalized_keys);
-
-    /**
-     * @brief Get all currently tracked landmarks
-     * @return Set of active landmark IDs
-     */
-    LandmarkIdSet getTrackedLandmarks() const;
+    size_t cleanCheiralityLandmarks(const gtsam::Symbol& lmk_symbol,
+                     const gtsam::NonlinearFactorGraph& graph_in_smoother,
+                     const gtsam::NonlinearFactorGraph& new_factors,
+                     const gtsam::Values& new_values,
+                     const fgo::solvers::FixedLagSmoother::KeyTimestampMap& new_timestamps,
+                     const gtsam::FactorIndices& delete_slots,
+                     gtsam::NonlinearFactorGraph* new_factors_out,
+                     gtsam::Values* new_values_out,
+                     fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps_out,
+                     gtsam::FactorIndices* delete_slots_out);
 
     /**
      * @brief Remove a landmark from tracking
@@ -544,11 +508,8 @@ public:
      */
     bool removeLandmark(const LandmarkId& lm_id);
 
-    /**
-     * @brief Get statistics about landmark tracking
-     * @return Map of statistic names to values
-     */
-    std::map<std::string, size_t> getLandmarkStatistics() const;
+    // Note: Generic (mono) smart-factor APIs were removed.
+    // The Kimera integration uses the stereo smart-factor interface below.
 
     // ========================================================================
     // STEREO VISUAL FACTOR INTERFACE (mirrors VioBackend)
@@ -646,9 +607,12 @@ public:
 
     /**
      * @brief Delete slots for smart factors that need updating
-     * @return Vector of factor slots to delete from smoother
+     *
+     * Mirrors Kimera-VIO VioBackend behavior: when a landmark is updated, delete
+     * the old smart factor slot (if it still exists in the smoother graph) in the
+     * SAME update where the replacement smart factor is added.
      */
-    std::vector<Slot> getSmartFactorSlotsToDelete() const;
+    std::vector<Slot> getSmartFactorSlotsToDelete();
 
     /**
      * @brief Update slot tracking after smoother update
@@ -743,6 +707,8 @@ protected:
     LandmarkIdSmartStereoFactorMap new_smart_stereo_factors_;
     // old_smart_stereo_factors_ stores (factor, slot) pairs where slot=-1 means not yet in graph
     std::map<LandmarkId, std::pair<SmartStereoFactorPtr, Slot>> old_smart_stereo_factors_;
+    
+    // (Removed) pending_delete_slots_: GTC now mirrors VioBackend immediate deletion.
     
     // Feature tracks (mirrors VioBackend::feature_tracks_)
     std::map<LandmarkId, StereoFeatureTrack> stereo_feature_tracks_;

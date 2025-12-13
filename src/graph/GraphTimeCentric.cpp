@@ -248,6 +248,7 @@ namespace fgo::graph {
     bool integrationSuccessfully = true;
 
     auto statePair = currentPredictedBuffer_.get_all_time_buffer_pair();
+    gtsam::KeyVector emptyRelatedKeys;
     for (const auto &integrator: integratorMap_) {
       appPtr_->getLogger().info("GraphTimeCentric: starting integrating measurement from " + integrator.first);
 
@@ -257,7 +258,7 @@ namespace fgo::graph {
                                                                statePair,
                                                                values_,
                                                                keyTimestampMap_,
-                                                               relatedKeys_);
+                                                               emptyRelatedKeys);
       appPtr_->getLogger().info("GraphTimeCentric: integrating measurement from " + integrator.first + " was " +
                             (integrationSuccessfully ? "successful" : "failed!"));
     }
@@ -495,6 +496,7 @@ namespace fgo::graph {
     bool integrationSuccessfully = true;
 
     auto statePair = currentPredictedBuffer_.get_all_time_buffer_pair();
+    gtsam::KeyVector emptyRelatedKeys;
     for (const auto &integrator: integratorMap_) {
       appPtr_->getLogger().info("GraphTimeCentric: starting integrating measurement from " + integrator.first);
 
@@ -504,7 +506,7 @@ namespace fgo::graph {
                                                                statePair,
                                                                values_,
                                                                keyTimestampMap_,
-                                                               relatedKeys_);
+                                                               emptyRelatedKeys);
       appPtr_->getLogger().info("GraphTimeCentric: integrating measurement from " + integrator.first + " was " +
                             (integrationSuccessfully ? "successful" : "failed!"));
     }
@@ -524,7 +526,9 @@ namespace fgo::graph {
     std::cout << "[online_fgo_core] GraphTimeCentric: OPTIMIZE" << std::endl;
     std::chrono::time_point<std::chrono::system_clock> start = std::chrono::system_clock::now();
 
-    solver_->update(*this, values_, keyTimestampMap_, gtsam::FactorIndices(), relatedKeys_);
+    // NOTE: For Kimera integration, optimization happens via GraphTimeCentricBackendAdapter callback
+    // This path is for legacy non-Kimera use cases
+    solver_->update(*this, values_, keyTimestampMap_, gtsam::FactorIndices(), gtsam::KeyVector());
     gtsam::Values result = solver_->calculateEstimate();
     gtsam::Marginals marginals;
 
@@ -611,3 +615,4 @@ namespace fgo::graph {
   }
 
 }
+

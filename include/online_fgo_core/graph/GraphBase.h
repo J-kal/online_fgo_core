@@ -152,7 +152,6 @@ namespace fgo::graph {
     fgo::core::CircularDataBuffer<fgo::data::State> currentPredictedBuffer_;
     fgo::core::CircularDataBuffer<std::vector<gtsam::NonlinearFactor::shared_ptr>> factorBuffer_;
     fgo::core::CircularDataBuffer<std::pair<gtsam::Values, gtsam::Marginals>> resultMarginalBuffer_;
-    gtsam::KeyVector relatedKeys_;
 
   protected: // protected functions
 
@@ -346,7 +345,6 @@ namespace fgo::graph {
       this->resize(0);
       keyTimestampMap_.clear();
       values_.clear();
-      relatedKeys_.clear();
     }
 
     [[nodiscard]] const gtsam::Values &getValues() const { return values_; }

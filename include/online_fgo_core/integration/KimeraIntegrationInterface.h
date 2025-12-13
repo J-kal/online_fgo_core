@@ -282,10 +282,16 @@ struct OmegaAtState {
    */
   class KimeraIntegrationInterface {
   public:
+    // Type aliases matching GraphTimeCentricKimera
+    using LandmarkId = fgo::graph::GraphTimeCentricKimera::LandmarkId;
+    using Slot = fgo::graph::GraphTimeCentricKimera::Slot;
+    
     struct IncrementalUpdatePacket {
       gtsam::NonlinearFactorGraph factors;
       gtsam::Values values;
       fgo::solvers::FixedLagSmoother::KeyTimestampMap key_timestamps;
+      gtsam::FactorIndices delete_slots;  // Slots of SmartFactors to delete/replace
+      std::vector<LandmarkId> new_smart_factor_lmk_ids;  // Landmark IDs of new SmartFactors (for slot tracking)
     };
 
     /**
@@ -464,7 +470,6 @@ struct OmegaAtState {
     /**
      * @brief Stereo measurement type (matches Kimera's StereoMeasurement)
      */
-    using LandmarkId = int64_t;
     using FrameId = int64_t;
     using StereoMeasurement = std::pair<LandmarkId, gtsam::StereoPoint2>;
 
@@ -537,6 +542,17 @@ struct OmegaAtState {
 
     bool buildIncrementalUpdate(IncrementalUpdatePacket* packet);
     void markIncrementalUpdateConsumed();
+    
+    /**
+     * @brief Update SmartFactor slot tracking after ISAM2 optimization
+     * @param lmk_ids Landmark IDs of SmartFactors
+     * @param slots Slot indices assigned by ISAM2
+     * 
+     * This is called after smoother update to track which slots in the factor
+     * graph correspond to which SmartFactors, enabling proper deletion on updates.
+     */
+    void updateSmartFactorSlots(const std::vector<LandmarkId>& lmk_ids,
+                                const std::vector<Slot>& slots);
 
     // ========================================================================
     // RESULT RETRIEVAL

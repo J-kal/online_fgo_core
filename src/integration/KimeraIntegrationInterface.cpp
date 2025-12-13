@@ -29,6 +29,7 @@
 #include <limits.h>    // for PATH_MAX
 #include <stdlib.h>    // for realpath
 #include <unistd.h>    // for getcwd
+#include <gtsam/slam/dataset.h>  // for writeG2o
 
 namespace fgo::integration {
 
@@ -112,7 +113,7 @@ static void saveFactorGraphDebugInfo(
     // 2. Save .g2o file (standard factor graph format)
     std::string g2o_filename = prefix + ".g2o";
     logger.error("Saving .g2o file to: " + g2o_filename);
-    graph.saveGraph(g2o_filename, values);
+    gtsam::writeG2o(graph, values, g2o_filename);
     
     // 3. Save .dot file (GraphViz visualization format)
     std::string dot_filename = prefix + ".dot";
@@ -621,7 +622,8 @@ bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
     std::string current_dir = (getcwd(cwd, sizeof(cwd)) != nullptr) ? std::string(cwd) : "unknown";
     
     try {
-      current_graph.saveGraph(g2o_filename, current_values);
+      // Use GTSAM's writeG2o function to save in proper .g2o format
+      gtsam::writeG2o(current_graph, current_values, g2o_filename);
       
       // Verify file was actually created
       struct stat file_info;
@@ -717,15 +719,19 @@ bool KimeraIntegrationInterface::buildIncrementalUpdate(
 
   app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: calling graph_->buildIncrementalUpdate");
   
+  // Pass delete_slots and new_smart_factor_lmk_ids to the graph
+  // This enables proper SmartFactor update tracking
   bool result = graph_->buildIncrementalUpdate(
-      &packet->factors, &packet->values, &packet->key_timestamps);
+      &packet->factors, &packet->values, &packet->key_timestamps,
+      &packet->delete_slots, &packet->new_smart_factor_lmk_ids);
   
   
   
   app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: result=" + 
                         std::to_string(result) + " factors=" + std::to_string(packet->factors.size()) +
                         " values=" + std::to_string(packet->values.size()) +
-                        " key_timestamps=" + std::to_string(packet->key_timestamps.size()));
+                        " key_timestamps=" + std::to_string(packet->key_timestamps.size()) +
+                        " delete_slots=" + std::to_string(packet->delete_slots.size()));
   return result;
 }
 
@@ -733,6 +739,21 @@ void KimeraIntegrationInterface::markIncrementalUpdateConsumed() {
   if (graph_) {
     graph_->finalizeIncrementalUpdate();
   }
+}
+
+void KimeraIntegrationInterface::updateSmartFactorSlots(
+    const std::vector<LandmarkId>& lmk_ids,
+    const std::vector<Slot>& slots) {
+  if (!graph_) {
+    app_->getLogger().error("KimeraIntegrationInterface::updateSmartFactorSlots: graph is null");
+    return;
+  }
+  
+  // Forward to GraphTimeCentricKimera's slot tracking
+  graph_->updateSmartFactorSlots(lmk_ids, slots);
+  
+  app_->getLogger().info("KimeraIntegrationInterface::updateSmartFactorSlots: Updated " + 
+                         std::to_string(lmk_ids.size()) + " SmartFactor slots");
 }
 
 // ========================================================================
