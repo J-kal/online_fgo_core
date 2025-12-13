@@ -199,14 +199,22 @@ bool GraphTimeCentricKimera::addKeyframeState(double timestamp,
     appPtr_->getLogger().debug("GraphTimeCentricKimera: State " + std::to_string(state_idx) + 
                                " already exists, updating values");
   } else {
-    // Create initial values for the new state
-    if (!createInitialValuesForState(state_idx, timestamp)) {
-      appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to create initial values for state " +
-                                 std::to_string(state_idx));
-      return false;
-    }
+    // For Kimera integration, skip createInitialValuesForState() since:
+    // 1. currentPredictedBuffer_ is not populated (buffer query returns identity pose)
+    // 2. VioBackend provides correct PIM-predicted initial values via setStateInitialValues()
+    // 3. createInitialValuesForState() would insert wrong values into new_values_since_last_opt_
+    //
+    // Only create timestamp mappings without querying the buffer
+    keyTimestampMap_[pose_key] = timestamp;
+    keyTimestampMap_[V(state_idx)] = timestamp;
+    keyTimestampMap_[B(state_idx)] = timestamp;
+    currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
+    
     // Update timestamp mapping
     updateTimestampIndex(timestamp, state_idx);
+    
+    appPtr_->getLogger().info("GraphTimeCentricKimera: Skipped buffer query for Kimera state " +
+                              std::to_string(state_idx) + " (will use PIM-predicted values)");
   }
   
   // Track the highest state index for nState_
@@ -1154,10 +1162,19 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
     gtsam::Key vel_key = V(state_idx);
     gtsam::Key bias_key = B(state_idx);
     
-    // Update or insert initial values
+    // CRITICAL: Insert PIM-predicted initial values directly into both data structures.
+    // For Kimera integration, createInitialValuesForState() is skipped (buffer is empty),
+    // so this function now does the initial insertion with correct values from VioBackend.
     if (values_.exists(pose_key)) {
+      // Update case: state was created by a previous call or bootstrap
       values_.update(pose_key, pose);
+      if (new_values_since_last_opt_.exists(pose_key)) {
+        new_values_since_last_opt_.update(pose_key, pose);
+      } else {
+        new_values_since_last_opt_.insert(pose_key, pose);
+      }
     } else {
+      // Insert case: fresh state, insert into both data structures
       values_.insert(pose_key, pose);
       new_values_since_last_opt_.insert(pose_key, pose);
       if (keyTimestampMap_.find(pose_key) != keyTimestampMap_.end()) {
@@ -1167,6 +1184,11 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
     
     if (values_.exists(vel_key)) {
       values_.update(vel_key, velocity);
+      if (new_values_since_last_opt_.exists(vel_key)) {
+        new_values_since_last_opt_.update(vel_key, velocity);
+      } else {
+        new_values_since_last_opt_.insert(vel_key, velocity);
+      }
     } else {
       values_.insert(vel_key, velocity);
       new_values_since_last_opt_.insert(vel_key, velocity);
@@ -1177,6 +1199,11 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
     
     if (values_.exists(bias_key)) {
       values_.update(bias_key, bias);
+      if (new_values_since_last_opt_.exists(bias_key)) {
+        new_values_since_last_opt_.update(bias_key, bias);
+      } else {
+        new_values_since_last_opt_.insert(bias_key, bias);
+      }
     } else {
       values_.insert(bias_key, bias);
       new_values_since_last_opt_.insert(bias_key, bias);
