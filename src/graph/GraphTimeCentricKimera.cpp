@@ -464,6 +464,26 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
   return true;
 }
 
+// Helper method to compute 6D acceleration vectors with proper angular acceleration
+std::pair<gtsam::Vector6, gtsam::Vector6> GraphTimeCentricKimera::computeAccelerationVectors(
+    const OmegaAtState& omega_i,
+    const OmegaAtState& omega_j,
+    double dt) const {
+  
+  // Compute angular acceleration as derivative: (omega_j - omega_i) / dt
+  gtsam::Vector3 angular_acc = (omega_j.omega - omega_i.omega) / dt;
+  
+  // Build 6D acceleration vectors: [angular_acc (3D), linear_acc (3D)]
+  // This matches the structure used by convertVwWbToVbWb and GP factors
+  gtsam::Vector6 acc_i;
+  acc_i << angular_acc, omega_i.acc;
+  
+  gtsam::Vector6 acc_j;
+  acc_j << angular_acc, omega_j.acc;
+  
+  return {acc_i, acc_j};
+}
+
 bool GraphTimeCentricKimera::addGPMotionPrior(
     size_t state_i_idx,
     size_t state_j_idx,
@@ -542,15 +562,14 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           pose_j, vel_j, omega_key_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_prior);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_prior);
       gp_type_name = "GPWNOAPrior";
       break;
     }
     
     case fgo::data::GPModelType::WNOJ: {
-      gtsam::Vector6 acc_i = omega_i.getAccVector6();
-      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      auto [acc_i, acc_j] = computeAccelerationVectors(omega_i, omega_j, dt);
       
       auto gp_prior = boost::make_shared<fgo::factor::GPWNOJPrior>(
           pose_i, vel_i, omega_key_i,
@@ -558,7 +577,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           acc_i, acc_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_prior);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_prior);
       gp_type_name = "GPWNOJPrior";
       break;
@@ -570,11 +589,10 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           pose_j, vel_j, omega_key_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_wnoa);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_wnoa);
       
-      gtsam::Vector6 acc_i = omega_i.getAccVector6();
-      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      auto [acc_i, acc_j] = computeAccelerationVectors(omega_i, omega_j, dt);
       
       auto gp_wnoj = boost::make_shared<fgo::factor::GPWNOJPrior>(
           pose_i, vel_i, omega_key_i,
@@ -582,7 +600,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           acc_i, acc_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_wnoj);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_wnoj);
       
       gp_type_name = "GPWNOAPrior + GPWNOJPrior";
@@ -590,8 +608,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
     }
     
     case fgo::data::GPModelType::Singer: {
-      gtsam::Vector6 acc_i = omega_i.getAccVector6();
-      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      auto [acc_i, acc_j] = computeAccelerationVectors(omega_i, omega_j, dt);
       
       auto gp_prior = boost::make_shared<fgo::factor::GPSingerPrior>(
           pose_i, vel_i, omega_key_i,
@@ -599,7 +616,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           dt, gp_qc_model_, gp_ad_matrix_,
           acc_i, acc_j,
           false, true);
-      this->push_back(gp_prior);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_prior);
       gp_type_name = "GPSingerPrior";
       break;
@@ -611,11 +628,10 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           pose_j, vel_j, omega_key_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_wnoa);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_wnoa);
       
-      gtsam::Vector6 acc_i = omega_i.getAccVector6();
-      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      auto [acc_i, acc_j] = computeAccelerationVectors(omega_i, omega_j, dt);
       
       auto gp_singer = boost::make_shared<fgo::factor::GPSingerPrior>(
           pose_i, vel_i, omega_key_i,
@@ -623,7 +639,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           dt, gp_qc_model_, gp_ad_matrix_,
           acc_i, acc_j,
           false, true);
-      this->push_back(gp_singer);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_singer);
       
       gp_type_name = "GPWNOAPrior + GPSingerPrior";
@@ -631,15 +647,14 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
     }
     
     case fgo::data::GPModelType::WNOA_WNOJ_Singer: {
-      gtsam::Vector6 acc_i = omega_i.getAccVector6();
-      gtsam::Vector6 acc_j = omega_j.getAccVector6();
+      auto [acc_i, acc_j] = computeAccelerationVectors(omega_i, omega_j, dt);
       
       auto gp_wnoa = boost::make_shared<fgo::factor::GPWNOAPrior>(
           pose_i, vel_i, omega_key_i,
           pose_j, vel_j, omega_key_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_wnoa);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_wnoa);
       
       auto gp_wnoj = boost::make_shared<fgo::factor::GPWNOJPrior>(
@@ -648,7 +663,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           acc_i, acc_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_wnoj);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_wnoj);
       
       auto gp_singer = boost::make_shared<fgo::factor::GPSingerPrior>(
@@ -657,7 +672,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           dt, gp_qc_model_, gp_ad_matrix_,
           acc_i, acc_j,
           false, true);
-      this->push_back(gp_singer);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_singer);
       
       gp_type_name = "GPWNOAPrior + GPWNOJPrior + GPSingerPrior";
@@ -672,7 +687,7 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
           pose_j, vel_j, omega_key_j,
           dt, gp_qc_model_,
           false, true);
-      this->push_back(gp_prior);
+      // Only add to new_factors for smoother marginalization - don't accumulate in base graph
       new_factors_since_last_opt_.push_back(gp_prior);
       gp_type_name = "GPWNOAPrior (fallback)";
       break;
@@ -1124,7 +1139,9 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
         if (kimeraParams_.addGPMotionPriors) {
           gtsam::Key omega_key = W(state_idx);
           values_.insert(omega_key, predicted_state.omega);
+          new_values_since_last_opt_.insert(omega_key, predicted_state.omega);
           keyTimestampMap_[omega_key] = timestamp;
+          new_key_timestamps_since_last_opt_[omega_key] = timestamp;
           
           gtsam::Key acc_key = A(state_idx);
           // Get acceleration from buffer if available, otherwise use zero
@@ -1133,7 +1150,9 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
             acc = accBuffer_.get_buffer_from_id(state_idx - 1);
           }
           values_.insert(acc_key, acc);
+          new_values_since_last_opt_.insert(acc_key, acc);
           keyTimestampMap_[acc_key] = timestamp;
+          new_key_timestamps_since_last_opt_[acc_key] = timestamp;
         }    
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " +
                                std::to_string(state_idx) + " at timestamp " +

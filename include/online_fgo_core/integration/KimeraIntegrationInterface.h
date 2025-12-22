@@ -180,21 +180,6 @@ struct OmegaAtState {
         ts);
   }
   
-  /**
-   * @brief Get combined 6-DOF acceleration vector for GP priors
-   * @return 6x1 vector [linear_acc (3), angular_acc (3)]
-   * 
-   * Note: Angular acceleration is approximated as zero (instantaneous omega).
-   * For WNOJ, this represents the "acceleration" state in the GP formulation.
-   */
-  gtsam::Vector6 getAccVector6() const {
-    // GP priors use 6-DOF state: [linear (3), angular (3)]
-    // Linear = bias-corrected accelerometer reading
-    // Angular = rate of change of omega (approximated as 0 at instantaneous measurement)
-    gtsam::Vector6 acc_vec;
-    acc_vec << acc, gtsam::Vector3::Zero();  // Angular acceleration = 0 (instantaneous)
-    return acc_vec;
-  }
   
   /// Print for debugging
   void print(const std::string& prefix = "") const {

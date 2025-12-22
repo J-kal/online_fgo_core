@@ -342,6 +342,24 @@ public:
         const gtsam::PreintegrationType& pim);
     
     /**
+     * @brief Compute 6D acceleration vectors with proper angular acceleration
+     * 
+     * Helper method to compute acceleration vectors [angular_acc, linear_acc]
+     * where angular_acc = (omega_j - omega_i) / dt.
+     * This structure matches the convention used by convertVwWbToVbWb and GP factors,
+     * where 6D vectors are ordered as [angular (3D), linear (3D)].
+     * 
+     * @param omega_i OmegaAtState for state i
+     * @param omega_j OmegaAtState for state j
+     * @param dt Time delta between states (seconds)
+     * @return Pair of 6D acceleration vectors (acc_i, acc_j)
+     */
+    std::pair<gtsam::Vector6, gtsam::Vector6> computeAccelerationVectors(
+        const OmegaAtState& omega_i,
+        const OmegaAtState& omega_j,
+        double dt) const;
+    
+    /**
      * @brief Add GP motion prior factor between two states (SEPARATE from IMU)
      * 
      * Creates GP motion prior factors (GPWNOAPrior, GPWNOJPrior, GPSingerPrior, or combinations)
