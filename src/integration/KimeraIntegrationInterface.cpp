@@ -29,6 +29,8 @@
 #include <limits.h>    // for PATH_MAX
 #include <stdlib.h>    // for realpath
 #include <unistd.h>    // for getcwd
+#include <algorithm>   // for std::replace
+#include <typeinfo>    // for typeid
 #include <gtsam/slam/dataset.h>  // for writeG2o
 
 namespace fgo::integration {
@@ -63,96 +65,25 @@ static bool createDirectoryRecursive(const std::string& path) {
   return false;
 }
 
-// Helper function to save factor graph debug information
-static void saveFactorGraphDebugInfo(
-    const gtsam::NonlinearFactorGraph& graph,
-    const gtsam::Values& values,
-    const std::string& error_type,
-    fgo::core::LoggerInterface& logger) {
+static std::string getDescriptiveFactorName(const gtsam::NonlinearFactor& factor) {
+  const std::string name = typeid(factor).name();
+  // Map common GTSAM/Kimera factor types to human-readable names
+  if (name.find("CombinedImuFactor") != std::string::npos) return "IMU_Combined";
+  if (name.find("ImuFactor") != std::string::npos) return "IMU";
+  if (name.find("SmartStereoProjectionPoseFactor") != std::string::npos) return "Visual_Smart";
+  if (name.find("SmartProjectionPoseFactor") != std::string::npos) return "Visual_Smart";
+  if (name.find("GenericStereoFactor") != std::string::npos) return "Visual_Stereo";
+  if (name.find("PriorFactor") != std::string::npos) return "Prior";
+  if (name.find("BetweenFactor") != std::string::npos) return "Between";
+  if (name.find("GPWNOAPrior") != std::string::npos) return "GP_WNOA";
+  if (name.find("GPWNOJPrior") != std::string::npos) return "GP_WNOJ";
+  if (name.find("GPSinger") != std::string::npos) return "GP_Singer";
   
-  try {
-    // Create debug_run_logs directory if it doesn't exist
-    const std::string debug_dir = "debug_run_logs";
-    mkdir(debug_dir.c_str(), 0755);
-    
-    // Generate timestamp for filenames
-    auto now = std::chrono::system_clock::now();
-    auto time_t_now = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_now = *std::localtime(&time_t_now);
-    
-    std::ostringstream timestamp_ss;
-    timestamp_ss << std::put_time(&tm_now, "%Y%m%d_%H%M%S");
-    std::string timestamp = timestamp_ss.str();
-    
-    std::string prefix = debug_dir + "/" + error_type + "_" + timestamp;
-    
-    // 1. Print factor keys to logger (easier to read than full graph)
-    logger.error("=== Factor Graph Debug Info (" + error_type + ") ===");
-    logger.error("Total factors: " + std::to_string(graph.size()));
-    logger.error("Total values: " + std::to_string(values.size()));
-    
-    logger.error("\n--- Factor Keys ---");
-    for (size_t i = 0; i < graph.size(); ++i) {
-      if (graph[i]) {
-        std::ostringstream keys_ss;
-        keys_ss << "Factor " << i << ": ";
-        for (const auto& key : graph[i]->keys()) {
-          keys_ss << gtsam::DefaultKeyFormatter(key) << " ";
-        }
-        logger.error(keys_ss.str());
-      }
-    }
-    
-    logger.error("\n--- Value Keys ---");
-    std::ostringstream values_ss;
-    for (const auto& key_value : values) {
-      values_ss << gtsam::DefaultKeyFormatter(key_value.key) << " ";
-    }
-    logger.error(values_ss.str());
-    
-    // 2. Save .g2o file (standard factor graph format)
-    std::string g2o_filename = prefix + ".g2o";
-    logger.error("Saving .g2o file to: " + g2o_filename);
-    gtsam::writeG2o(graph, values, g2o_filename);
-    
-    // 3. Save .dot file (GraphViz visualization format)
-    std::string dot_filename = prefix + ".dot";
-    logger.error("Saving .dot file to: " + dot_filename);
-    std::ofstream dot_file(dot_filename);
-    if (dot_file.is_open()) {
-      // Use the print method with a custom formatter
-      dot_file << "digraph G {" << std::endl;
-      dot_file << "  // Factor Graph Visualization" << std::endl;
-      dot_file << "  // Total factors: " << graph.size() << std::endl;
-      dot_file << "  // Total values: " << values.size() << std::endl;
-      
-      // Add nodes for values
-      for (const auto& key_value : values) {
-        dot_file << "  " << gtsam::DefaultKeyFormatter(key_value.key) 
-                << " [shape=box];" << std::endl;
-      }
-      
-      // Add edges for factors
-      for (size_t i = 0; i < graph.size(); ++i) {
-        if (graph[i] && graph[i]->size() > 1) {
-          auto keys = graph[i]->keys();
-          for (size_t j = 1; j < keys.size(); ++j) {
-            dot_file << "  " << gtsam::DefaultKeyFormatter(keys[0]) 
-                    << " -> " << gtsam::DefaultKeyFormatter(keys[j])
-                    << " [label=\"F" << i << "\"];" << std::endl;
-          }
-        }
-      }
-      
-      dot_file << "}" << std::endl;
-      dot_file.close();
-    }
-    
-    logger.error("=== Factor Graph Debug Info saved ===\n");
-    
-  } catch (const std::exception& e) {
-    logger.error("Failed to save factor graph debug info: " + std::string(e.what()));
-  }
+  // Clean up RTTI names if not matched (some compilers mangle more than others)
+  size_t last_colon = name.find_last_of(':');
+  if (last_colon != std::string::npos) return name.substr(last_colon + 1);
+  
+  return name;
 }
 
 KimeraIntegrationInterface::KimeraIntegrationInterface(fgo::core::ApplicationInterface& app)
@@ -581,27 +512,59 @@ bool KimeraIntegrationInterface::addGPMotionPrior(
 
 bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration, 
                                                           const std::string& context,
-                                                          const std::string& save_dir) {
+                                                          const std::string& save_dir,
+                                                          bool include_smart_factors) {
   if (!initialized_ || !graph_) {
     app_->getLogger().warn("KimeraIntegrationInterface: Cannot save factor graph - not initialized");
     return false;
   }
   
+  // Get current graph and values
+  gtsam::NonlinearFactorGraph current_graph;
+  gtsam::Values current_values;
+  
+  if (!graph_->getCurrentGraphAndValues(current_graph, current_values)) {
+    app_->getLogger().warn("KimeraIntegrationInterface: Failed to get current graph and values");
+    return false;
+  }
+  
+  return saveFactorGraphDebugInfo(iteration, current_graph, current_values, context, save_dir, include_smart_factors);
+}
+
+bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
+                                                          const gtsam::NonlinearFactorGraph& current_graph,
+                                                          const gtsam::Values& current_values,
+                                                          const std::string& context,
+                                                          const std::string& save_dir,
+                                                          bool include_smart_factors) {
   try {
-    // Get current graph and values
-    gtsam::NonlinearFactorGraph current_graph;
-    gtsam::Values current_values;
-    
-    if (!graph_->getCurrentGraphAndValues(current_graph, current_values)) {
-      app_->getLogger().warn("KimeraIntegrationInterface: Failed to get current graph and values");
-      return false;
-    }
-    
     // Create save directory recursively if it doesn't exist
     if (!createDirectoryRecursive(save_dir)) {
       app_->getLogger().warn("KimeraIntegrationInterface: Failed to create directory: " + save_dir + 
                              " (files may not be saved)");
       // Try to continue - maybe directory already exists
+    }
+    
+    // Filter graph if requested
+    gtsam::NonlinearFactorGraph filtered_graph;
+    size_t smart_factors_filtered = 0;
+    
+    if (!include_smart_factors) {
+      // Filter out SmartStereoProjectionFactors
+      for (const auto& factor : current_graph) {
+        if (factor) {
+          // Check if this is a SmartStereoProjectionPoseFactor
+          if (boost::dynamic_pointer_cast<gtsam::SmartStereoProjectionPoseFactor>(factor)) {
+            smart_factors_filtered++;
+            continue;  // Skip this factor
+          }
+          filtered_graph.push_back(factor);
+        }
+      }
+      app_->getLogger().info("KimeraIntegrationInterface: Filtered " + std::to_string(smart_factors_filtered) + 
+                             " SmartStereoProjectionFactors from debug output");
+    } else {
+      filtered_graph = current_graph;  // Use all factors
     }
     
     // Generate filename with iteration number
@@ -623,15 +586,34 @@ bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
     
     try {
       // Use GTSAM's writeG2o function to save in proper .g2o format
-      gtsam::writeG2o(current_graph, current_values, g2o_filename);
+      gtsam::writeG2o(filtered_graph, current_values, g2o_filename);
+      
+      // Since writeG2o only supports a limited set of factors, 
+      // we manually append details of all factors as comments to the file
+      std::ofstream g2o_file(g2o_filename, std::ios_base::app);
+      if (g2o_file.is_open()) {
+        g2o_file << "\n# --- Additional Factor Details ---" << std::endl;
+        for (size_t i = 0; i < filtered_graph.size(); ++i) {
+          if (filtered_graph[i]) {
+            g2o_file << "# Factor " << i << ": Keys=[ ";
+            for (const auto& key : filtered_graph[i]->keys()) {
+              g2o_file << gtsam::DefaultKeyFormatter(key) << " ";
+            }
+            g2o_file << "] Type=" << typeid(*filtered_graph[i]).name() 
+                     << " Error=" << filtered_graph[i]->error(current_values) << std::endl;
+          }
+        }
+        g2o_file.close();
+      }
       
       // Verify file was actually created
       struct stat file_info;
       bool file_exists = (stat(g2o_filename.c_str(), &file_info) == 0);
       
       app_->getLogger().info("KimeraIntegrationInterface: Saved factor graph to " + g2o_filename + 
-                             " (factors=" + std::to_string(current_graph.size()) + 
-                             ", values=" + std::to_string(current_values.size()) + 
+                             " (factors=" + std::to_string(filtered_graph.size()) + 
+                             " (filtered from " + std::to_string(current_graph.size()) + "), " +
+                             "values=" + std::to_string(current_values.size()) + 
                              ", dir=" + save_dir + ", abs_dir=" + abs_dir + 
                              ", cwd=" + current_dir + ", file_exists=" + (file_exists ? "yes" : "no") + ")");
       
@@ -653,23 +635,27 @@ bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
       dot_file << "  // Factor Graph Visualization" << '\n';
       dot_file << "  // Context: " << context << '\n';
       dot_file << "  // Iteration: " << iteration << '\n';
-      dot_file << "  // Total factors: " << current_graph.size() << '\n';
+      dot_file << "  // Total factors: " << filtered_graph.size() << " (original: " << current_graph.size() << ")" << '\n';
       dot_file << "  // Total values: " << current_values.size() << '\n';
+      dot_file << "  // SmartFactors filtered: " << (include_smart_factors ? "no" : "yes") << '\n';
       
       // Add nodes for values
       for (const auto& key_value : current_values) {
-        dot_file << "  " << gtsam::DefaultKeyFormatter(key_value.key) 
-                << " [shape=box];" << '\n';
+        dot_file << "  \"" << gtsam::DefaultKeyFormatter(key_value.key) 
+                << "\" [shape=box];" << '\n';
       }
       
       // Add edges for factors
-      for (size_t i = 0; i < current_graph.size(); ++i) {
-        if (current_graph[i] && current_graph[i]->size() > 1) {
-          auto keys = current_graph[i]->keys();
-          for (size_t j = 1; j < keys.size(); ++j) {
-            dot_file << "  " << gtsam::DefaultKeyFormatter(keys[0]) 
-                    << " -> " << gtsam::DefaultKeyFormatter(keys[j])
-                    << " [label=\"F" << i << "\"];" << '\n';
+      for (size_t i = 0; i < filtered_graph.size(); ++i) {
+        if (filtered_graph[i]) {
+          std::string factor_id = "F_" + std::to_string(i);
+          std::string factor_name = getDescriptiveFactorName(*filtered_graph[i]);
+          dot_file << "  " << factor_id << " [shape=circle, label=\"" << factor_name << "_" << i << "\"];" << '\n';
+          
+          auto keys = filtered_graph[i]->keys();
+          for (const auto& key : keys) {
+            dot_file << "  \"" << gtsam::DefaultKeyFormatter(key) 
+                    << "\" -> " << factor_id << " [dir=none];" << '\n';
           }
         }
       }
@@ -678,8 +664,10 @@ bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
       dot_file.close();
       app_->getLogger().info("KimeraIntegrationInterface: Saved factor graph visualization to " + dot_filename);
     } else {
-      app_->getLogger().warn("KimeraIntegrationInterface: Failed to open .dot file for writing");
+      app_->getLogger().warn("KimeraIntegrationInterface: Failed to open .dot file for writing: " + dot_filename);
     }
+    //   app_->getLogger().warn("KimeraIntegrationInterface: Failed to open .dot file for writing");
+    // }
     
     return true;
     
@@ -694,19 +682,10 @@ bool KimeraIntegrationInterface::saveFactorGraphDebugInfo(int iteration,
 // FACTOR INSERTION
 // ========================================================================
 
-bool KimeraIntegrationInterface::addFactor(const FactorData& factor_data) {
-  if (!initialized_) {
-    app_->getLogger().error("KimeraIntegrationInterface: Not initialized");
-    return false;
-  }
-  
-  // TODO: Implement when adding visual factors in Phase 3
-  app_->getLogger().warn("KimeraIntegrationInterface: addFactor not yet implemented");
-  return false;
-}
 
 bool KimeraIntegrationInterface::buildIncrementalUpdate(
-    KimeraIntegrationInterface::IncrementalUpdatePacket* packet) {
+    KimeraIntegrationInterface::IncrementalUpdatePacket* packet,
+    const gtsam::NonlinearFactorGraph* smoother_graph) {
   
   app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: ENTERED");
   
@@ -719,10 +698,11 @@ bool KimeraIntegrationInterface::buildIncrementalUpdate(
 
   app_->getLogger().info("KimeraIntegrationInterface::buildIncrementalUpdate: calling graph_->buildIncrementalUpdate");
   
-  // Pass delete_slots and new_smart_factor_lmk_ids to the graph
-  // This enables proper SmartFactor update tracking
+  // Pass smoother_graph for proper marginalization checking
+  // This enables GTC to skip factors that reference marginalized states
   bool result = graph_->buildIncrementalUpdate(
       &packet->factors, &packet->values, &packet->key_timestamps,
+      smoother_graph,
       &packet->delete_slots, &packet->new_smart_factor_lmk_ids);
   
   
@@ -735,7 +715,7 @@ bool KimeraIntegrationInterface::buildIncrementalUpdate(
   return result;
 }
 
-void KimeraIntegrationInterface::markIncrementalUpdateConsumed() {
+void KimeraIntegrationInterface::finalizeIncrementalUpdate() {
   if (graph_) {
     graph_->finalizeIncrementalUpdate();
   }

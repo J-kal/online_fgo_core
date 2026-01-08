@@ -147,7 +147,7 @@ target_link_libraries(online_fgo_factors INTERFACE
 add_library(online_fgo_solvers
     src/solver/FixedLagSmoother.cpp
     src/solver/BatchFixedLagSmoother.cpp
-    src/solver/IncrementalFixedLagSmoother.cpp
+    # src/solver/IncrementalFixedLagSmoother.cpp
 )
 target_include_directories(online_fgo_solvers
     PUBLIC

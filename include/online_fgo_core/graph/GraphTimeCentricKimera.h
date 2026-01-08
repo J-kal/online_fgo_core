@@ -472,6 +472,7 @@ public:
      *        incremental factors.
      * @param new_values Output values containing only the newly created keys.
      * @param new_timestamps Output timestamp map for the new keys.
+     * @param smoother_graph Current smoother graph for marginalization checking (optional)
      * @param delete_slots Output vector of factor slots to delete (for SmartFactor updates).
      * @param new_smart_factor_lmk_ids Output vector of landmark IDs for new SmartFactors (for slot tracking).
      * @return true if there is new information to optimize.
@@ -479,6 +480,7 @@ public:
     bool buildIncrementalUpdate(gtsam::NonlinearFactorGraph* new_factors,
                                 gtsam::Values* new_values,
                                 fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps,
+                                const gtsam::NonlinearFactorGraph* smoother_graph = nullptr,
                                 gtsam::FactorIndices* delete_slots = nullptr,
                                 std::vector<LandmarkId>* new_smart_factor_lmk_ids = nullptr);
 
@@ -617,6 +619,14 @@ public:
     }
 
     /**
+     * @brief Get existing smart stereo factor slots for validation
+     * @return Map of landmark IDs to (factor, slot) pairs
+     */
+    const std::map<LandmarkId, std::pair<SmartStereoFactorPtr, Slot>>& getOldSmartFactorSlots() const {
+        return old_smart_stereo_factors_;
+    }
+
+    /**
      * @brief Clear new smart factors after they've been consumed
      */
     void clearNewSmartStereoFactors() {
@@ -629,8 +639,13 @@ public:
      * Mirrors Kimera-VIO VioBackend behavior: when a landmark is updated, delete
      * the old smart factor slot (if it still exists in the smoother graph) in the
      * SAME update where the replacement smart factor is added.
+     * 
+     * @param smoother_graph Current smoother graph to check if slots still exist
+     * @param landmarks_to_remove Output vector of landmark IDs that were skipped due to marginalization
      */
-    std::vector<Slot> getSmartFactorSlotsToDelete();
+    std::vector<Slot> getSmartFactorSlotsToDelete(
+        const gtsam::NonlinearFactorGraph* smoother_graph = nullptr,
+        std::vector<LandmarkId>* landmarks_to_remove = nullptr);
 
     /**
      * @brief Update slot tracking after smoother update
@@ -639,6 +654,16 @@ public:
      */
     void updateSmartFactorSlots(const std::vector<LandmarkId>& lmk_ids,
                                 const std::vector<Slot>& factor_slots);
+
+    /**
+     * @brief Remove a landmark track that references marginalized states
+     * @param lmk_id Landmark ID to remove
+     * 
+     * This removes the landmark from feature tracks and old_smart_stereo_factors_
+     * when its observations reference states that have been marginalized out.
+     * Mirrors VioBackend::deleteLmkFromFeatureTracks behavior.
+     */
+    void removeLandmarkTrack(LandmarkId lmk_id);
 
     // ========================================================================
     // PARAMETERS AND CONFIGURATION
@@ -717,6 +742,11 @@ protected:
     gtsam::NonlinearFactorGraph new_factors_since_last_opt_;
     gtsam::Values new_values_since_last_opt_;
     fgo::solvers::FixedLagSmoother::KeyTimestampMap new_key_timestamps_since_last_opt_;
+    
+    // Track keys that have been successfully integrated into the smoother to avoid
+    // ValuesKeyAlreadyExists exceptions and ensure all required values are sent.
+    std::set<gtsam::Key> keys_sent_to_smoother_;
+    gtsam::KeySet keys_to_finalize_;
     
     // Smart factors already in the graph
     LandmarkIdSmartFactorMap old_smart_factors_;

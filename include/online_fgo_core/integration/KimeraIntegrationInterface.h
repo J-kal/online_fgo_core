@@ -222,6 +222,9 @@ struct OmegaAtState {
     bool optimize_on_keyframe = true;
     double optimization_period = 0.1;  // seconds
     
+    // Debug parameters
+    bool factor_graph_debug_include_smart_factors = true;  // Include SmartStereoProjectionFactors in debug output
+    
     KimeraIntegrationParams() = default;
   };
 
@@ -439,6 +442,7 @@ struct OmegaAtState {
      * @param iteration Iteration number (for filename)
      * @param context Context label (e.g., "after_optimization")
      * @param save_dir Directory to save files (default: "debug_run_logs")
+     * @param include_smart_factors Whether to include SmartStereoProjectionFactors in output
      * @return True if saved successfully
      * 
      * Saves the current factor graph and values to .g2o and .dot files
@@ -446,7 +450,26 @@ struct OmegaAtState {
      */
     bool saveFactorGraphDebugInfo(int iteration, 
                                   const std::string& context = "optimization",
-                                  const std::string& save_dir = "debug_run_logs");
+                                  const std::string& save_dir = "debug_run_logs",
+                                  bool include_smart_factors = true);
+
+    /**
+     * @brief Save specific factor graph and values for debugging
+     * 
+     * @param iteration Iteration number to unique-ify files
+     * @param graph The factor graph to save
+     * @param values The values to save
+     * @param context Context label
+     * @param save_dir Directory to save files
+     * @param include_smart_factors Whether to include SmartStereoProjectionFactors in output
+     * @return True if saved successfully
+     */
+    bool saveFactorGraphDebugInfo(int iteration,
+                                  const gtsam::NonlinearFactorGraph& graph,
+                                  const gtsam::Values& values,
+                                  const std::string& context = "optimization",
+                                  const std::string& save_dir = "debug_run_logs",
+                                  bool include_smart_factors = true);
 
     // ========================================================================
     // VISUAL FACTOR INTERFACE
@@ -525,8 +548,23 @@ struct OmegaAtState {
     // OPTIMIZATION
     // ========================================================================
 
-    bool buildIncrementalUpdate(IncrementalUpdatePacket* packet);
-    void markIncrementalUpdateConsumed();
+    /**
+     * @brief Finalize incremental update, clearing staging buffers
+     * 
+     * This should be called after a successful optimization to clear the
+     * factors and values that were sent to the smoother, preventing them
+     * from being sent again in the next cycle.
+     */
+    void finalizeIncrementalUpdate();
+
+    /**
+     * @brief Build incremental update packet for external smoother
+     * @param packet Output packet
+     * @param smoother_graph Current smoother graph for marginalization checking (optional)
+     * @return true if packet contains new information
+     */
+    bool buildIncrementalUpdate(IncrementalUpdatePacket* packet,
+                                const gtsam::NonlinearFactorGraph* smoother_graph = nullptr);
     
     /**
      * @brief Update SmartFactor slot tracking after ISAM2 optimization

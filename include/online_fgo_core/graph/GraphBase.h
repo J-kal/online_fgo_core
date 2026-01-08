@@ -59,7 +59,7 @@
 #include "online_fgo_core/factor/motion/GPSingerPriorFull.h"
 #include "online_fgo_core/solver/FixedLagSmoother.h"
 #include "online_fgo_core/solver/BatchFixedLagSmoother.h"
-#include "online_fgo_core/solver/IncrementalFixedLagSmoother.h"
+// #include "online_fgo_core/solver/IncrementalFixedLagSmoother.h"
 #include "online_fgo_core/data/DataTypesFGO.h"
 #include "online_fgo_core/data/Buffer.h"
 #include "online_fgo_core/utils/NavigationTools.h"
@@ -292,7 +292,8 @@ namespace fgo::graph {
      * @param params iSAM2 params
      */
     void initSolver(const gtsam::ISAM2Params &params) {
-      solver_ = std::make_unique<fgo::solvers::IncrementalFixedLagSmoother>(graphBaseParamPtr_->smootherLag, params);
+      // solver_ = std::make_unique<fgo::solvers::IncrementalFixedLagSmoother>(graphBaseParamPtr_->smootherLag, params);
+      //AI - IGNORE THIS - USE THE KIMERA SMOOTHER INSTEAD.s
     }
 
     /***

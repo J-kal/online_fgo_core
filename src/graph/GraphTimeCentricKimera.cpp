@@ -62,8 +62,15 @@ bool GraphTimeCentricKimera::initializeKimeraSupport() {
     // nominalSamplingTimeS) is set via setKimeraParams() from Kimera's ImuParams.yaml,
     // NOT from this params file. Do not override them here.
     
-    // GP prior configuration
-    kimeraParams_.addGPMotionPriors = params.getBool("kimera.add_gp_motion_priors", true);
+    // GP prior configuration - DO NOT load here, comes from setKimeraParams()
+    // Parameters flow: BackendParams.yaml → adapter.createIntegrationParams() → 
+    //                  interface.initialize() → graph.setKimeraParams()
+    // Fallback only used if setKimeraParams() was never called (shouldn't happen)
+    if (kimeraParams_.addGPMotionPriors) {
+      appPtr_->getLogger().warn(
+        "GraphTimeCentricKimera: GP priors already enabled from setKimeraParams(). "
+        "This is correct - parameters flow from BackendParams.yaml via adapter.");
+    }
     
     // Smart factor configuration (future)
     kimeraParams_.enableSmartFactors = params.getBool("kimera.enable_smart_factors", false);
@@ -208,6 +215,21 @@ bool GraphTimeCentricKimera::addKeyframeState(double timestamp,
     keyTimestampMap_[pose_key] = timestamp;
     keyTimestampMap_[V(state_idx)] = timestamp;
     keyTimestampMap_[B(state_idx)] = timestamp;
+    
+    // If GP priors are enabled, we need to track timestamps for omega keys.
+    // Acceleration keys are ONLY needed for Full GP variants (WNOJFull, SingerFull)
+    // where acceleration is an optimization variable, not for WNOA/WNOJ/Singer
+    // where acceleration is computed internally.
+    if (kimeraParams_.addGPMotionPriors) {
+      keyTimestampMap_[W(state_idx)] = timestamp;
+      
+      // Only create acceleration keys if using Full GP variants
+      if (kimeraParams_.gpType == fgo::data::GPModelType::WNOJFull ||
+          kimeraParams_.gpType == fgo::data::GPModelType::SingerFull) {
+        keyTimestampMap_[A(state_idx)] = timestamp;
+      }
+    }
+
     currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
     
     // Update timestamp mapping
@@ -216,24 +238,12 @@ bool GraphTimeCentricKimera::addKeyframeState(double timestamp,
     appPtr_->getLogger().info("GraphTimeCentricKimera: Skipped buffer query for Kimera state " +
                               std::to_string(state_idx) + " (will use PIM-predicted values)");
   }
-  
-  // Track the highest state index for nState_
-  if (state_idx > nState_) {
-    nState_ = state_idx;
-  }
-  
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Creating new state " + 
-                            std::to_string(state_idx) + " at timestamp " + 
-                            std::to_string(timestamp));
-  
-  bool initial_values_set = setStateInitialValues(state_idx, pose, velocity, bias);
-  if (!initial_values_set) {
-    appPtr_->getLogger().error("GraphTimeCentricKimera: Failed to set initial values for state " +
-                              std::to_string(state_idx));
-    return false;
-  }
-  appPtr_->getLogger().info("GraphTimeCentricKimera: Initial values set for state " +
-                            std::to_string(state_idx));
+
+  // CRITICAL FIX: Explicitly set the initial values for the new state.
+  // Previously, this was skipped assuming VioBackend would call setStateInitialValues separately,
+  // but VioBackend does not do that. This ensured keyframe states were never added to new_values.
+  setStateInitialValues(state_idx, pose, velocity, bias);
+
   out_state_idx = state_idx;
   return true;
 }
@@ -401,7 +411,7 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
           bias_i, bias_j,
           *combined_pim);
       
-      this->push_back(imu_factor);
+       // this->push_back(imu_factor);
       new_factors_since_last_opt_.push_back(imu_factor);
       
       appPtr_->getLogger().debug("GraphTimeCentricKimera: Added CombinedImuFactor between states " + 
@@ -423,7 +433,7 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
           bias_i,
           *regular_pim);
       
-      this->push_back(imu_factor);
+       // this->push_back(imu_factor);
       new_factors_since_last_opt_.push_back(imu_factor);
       
       // Add bias evolution factor (matches VioBackend::addImuFactor exactly)
@@ -448,7 +458,7 @@ bool GraphTimeCentricKimera::addIMUFactorFromPIM(
           boost::make_shared<gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>>(
               bias_i, bias_j, zero_bias, bias_noise_model);
       
-      this->push_back(bias_between_factor);
+       // this->push_back(bias_between_factor);
       new_factors_since_last_opt_.push_back(bias_between_factor);
       
       appPtr_->getLogger().debug("GraphTimeCentricKimera: Added ImuFactor + BiasBetweenFactor between states " + 
@@ -524,33 +534,55 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
     timestamp_j = keyTimestampMap_[pose_j];
   }
   
-  // Add omega_i to values if not already present
-  if (!values_.exists(omega_key_i)) {
+  // Add omega_i to values or update
+  if (values_.exists(omega_key_i)) {
+    values_.update(omega_key_i, omega_i.omega);
+  } else {
     values_.insert(omega_key_i, omega_i.omega);
-    new_values_since_last_opt_.insert(omega_key_i, omega_i.omega);
-    keyTimestampMap_[omega_key_i] = timestamp_i;
-    new_key_timestamps_since_last_opt_[omega_key_i] = timestamp_i;
-    
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega key W(" + 
-                               std::to_string(state_i_idx) + ") = [" +
-                               std::to_string(omega_i.omega.x()) + ", " +
-                               std::to_string(omega_i.omega.y()) + ", " +
-                               std::to_string(omega_i.omega.z()) + "] rad/s");
   }
   
-  // Add omega_j to values if not already present
-  if (!values_.exists(omega_key_j)) {
-    values_.insert(omega_key_j, omega_j.omega);
-    new_values_since_last_opt_.insert(omega_key_j, omega_j.omega);
-    keyTimestampMap_[omega_key_j] = timestamp_j;
-    new_key_timestamps_since_last_opt_[omega_key_j] = timestamp_j;
-    
-    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega key W(" + 
-                               std::to_string(state_j_idx) + ") = [" +
-                               std::to_string(omega_j.omega.x()) + ", " +
-                               std::to_string(omega_j.omega.y()) + ", " +
-                               std::to_string(omega_j.omega.z()) + "] rad/s");
+  // ALWAYS stage for the next optimization to ensure smoother has the latest values
+  if (new_values_since_last_opt_.exists(omega_key_i)) {
+    new_values_since_last_opt_.update(omega_key_i, omega_i.omega);
+  } else {
+    new_values_since_last_opt_.insert(omega_key_i, omega_i.omega);
   }
+  keyTimestampMap_[omega_key_i] = timestamp_i;
+  // Only add timestamp if key hasn't been sent yet (otherwise causes mismatch with filtered values)
+  if (keys_sent_to_smoother_.find(omega_key_i) == keys_sent_to_smoother_.end()) {
+    new_key_timestamps_since_last_opt_[omega_key_i] = timestamp_i;
+  }
+  
+  appPtr_->getLogger().debug("GraphTimeCentricKimera: Added/Updated omega key W(" + 
+                             std::to_string(state_i_idx) + ") = [" +
+                             std::to_string(omega_i.omega.x()) + ", " +
+                             std::to_string(omega_i.omega.y()) + ", " +
+                             std::to_string(omega_i.omega.z()) + "] rad/s");
+  
+  // Add omega_j to values or update
+  if (values_.exists(omega_key_j)) {
+    values_.update(omega_key_j, omega_j.omega);
+  } else {
+    values_.insert(omega_key_j, omega_j.omega);
+  }
+  
+  // ALWAYS stage for the next optimization to ensure smoother has the latest values
+  if (new_values_since_last_opt_.exists(omega_key_j)) {
+    new_values_since_last_opt_.update(omega_key_j, omega_j.omega);
+  } else {
+    new_values_since_last_opt_.insert(omega_key_j, omega_j.omega);
+  }
+  keyTimestampMap_[omega_key_j] = timestamp_j;
+  // Only add timestamp if key hasn't been sent yet (otherwise causes mismatch with filtered values)
+  if (keys_sent_to_smoother_.find(omega_key_j) == keys_sent_to_smoother_.end()) {
+    new_key_timestamps_since_last_opt_[omega_key_j] = timestamp_j;
+  }
+  
+  appPtr_->getLogger().debug("GraphTimeCentricKimera: Added/Updated omega key W(" + 
+                             std::to_string(state_j_idx) + ") = [" +
+                             std::to_string(omega_j.omega.x()) + ", " +
+                             std::to_string(omega_j.omega.y()) + ", " +
+                             std::to_string(omega_j.omega.z()) + "] rad/s");
   
   // Create GP motion prior based on gpType
   std::string gp_type_name;
@@ -756,7 +788,8 @@ bool GraphTimeCentricKimera::addExternalFactor(
   }
   
   // Add factor to graph
-  this->push_back(factor);
+  // this->push_back(factor); // Disabled for Stateless GTC
+  new_factors_since_last_opt_.push_back(factor);
   
   appPtr_->getLogger().debug("GraphTimeCentricKimera: Added external factor connecting " + 
                              std::to_string(state_indices.size()) + " states");
@@ -768,6 +801,7 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     gtsam::NonlinearFactorGraph* new_factors,
     gtsam::Values* new_values,
     fgo::solvers::FixedLagSmoother::KeyTimestampMap* new_timestamps,
+    const gtsam::NonlinearFactorGraph* smoother_graph,
     gtsam::FactorIndices* delete_slots,
     std::vector<LandmarkId>* new_smart_factor_lmk_ids) {
   
@@ -795,64 +829,144 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
   // Debug current graph / value state before deciding what to return.
   appPtr_->getLogger().info(
       "GraphTimeCentricKimera::buildIncrementalUpdate: "
-      "graph_size=" + std::to_string(this->size()) +
-      " values_size=" + std::to_string(values_.size()) +
-      " keyTimestampMap_size=" + std::to_string(keyTimestampMap_.size()) +
-      " first_state_priors_added_=" + std::to_string(first_state_priors_added_));
+      "GraphSize=" + std::to_string(this->size()) +
+      ", new_factors=" + std::to_string(new_factors_since_last_opt_.size()) +
+      ", total_values=" + std::to_string(values_.size()) +
+      ", keyTimestampMap_size=" + std::to_string(keyTimestampMap_.size()) +
+      ", keys_sent=" + std::to_string(keys_sent_to_smoother_.size()) +
+      ", first_state_priors_added_=" + std::to_string(first_state_priors_added_));
 
-  if (this->size() == 0) {
+  if (values_.empty()) {
     appPtr_->getLogger().warn(
-        "GraphTimeCentricKimera::buildIncrementalUpdate: no factors in graph, returning false");
+        "GraphTimeCentricKimera::buildIncrementalUpdate: no values in graph, returning false");
     return false;
   }
 
-  if (new_factors_since_last_opt_.empty() && new_values_since_last_opt_.empty()) {
-    appPtr_->getLogger().info(
-        "GraphTimeCentricKimera::buildIncrementalUpdate: no new factors/values since last opt");
-    return false;
-  }
-
-  // CRITICAL: SmartFactors MUST be FIRST in new_factors for correct slot mapping
-  // This mirrors VioBackend::optimize() which adds SmartFactors first, then IMU/priors
-  // The slot tracking in GraphTimeCentricBackendAdapter relies on this ordering
-  
-  // Step 1: Add SmartFactors first, tracking their landmark IDs in order
+  // Step 1: Add SmartFactors WITH marginalization check (mirrors Kimera VioBackend::optimize)
+  // This is the CRITICAL fix: check if factors still exist BEFORE trying to update them
   if (new_smart_factor_lmk_ids) {
     new_smart_factor_lmk_ids->clear();
   }
   
+  std::vector<LandmarkId> marginalized_landmarks;
+  
   for (const auto& [lmk_id, factor_ptr] : new_smart_stereo_factors_) {
-    new_factors->push_back(factor_ptr);
-    if (new_smart_factor_lmk_ids) {
-      new_smart_factor_lmk_ids->push_back(lmk_id);
+    // Find the old factor and its slot
+    auto old_it = old_smart_stereo_factors_.find(lmk_id);
+    if (old_it == old_smart_stereo_factors_.end()) {
+      // New factor with no history - just add it
+      new_factors->push_back(factor_ptr);
+      if (new_smart_factor_lmk_ids) {
+        new_smart_factor_lmk_ids->push_back(lmk_id);
+      }
+      continue;
     }
+    
+    const Slot slot = old_it->second.second;
+    
+    if (slot == -1) {
+      // Factor never added to graph before - add it now
+      new_factors->push_back(factor_ptr);
+      if (new_smart_factor_lmk_ids) {
+        new_smart_factor_lmk_ids->push_back(lmk_id);
+      }
+    } else {
+      // Factor was previously in graph - check if it still exists
+      // CRITICAL: This prevents the "invalid key" crash when states are marginalized
+      if (smoother_graph && smoother_graph->exists(slot)) {
+        // Factor still exists - safe to update
+        new_factors->push_back(factor_ptr);
+        if (new_smart_factor_lmk_ids) {
+          new_smart_factor_lmk_ids->push_back(lmk_id);
+        }
+      } else if (!smoother_graph) {
+        // No smoother graph provided - assume factor exists (backward compatibility)
+        new_factors->push_back(factor_ptr);
+        if (new_smart_factor_lmk_ids) {
+          new_smart_factor_lmk_ids->push_back(lmk_id);
+        }
+      } else {
+        // Factor was MARGINALIZED OUT - skip this update and clean up
+        appPtr_->getLogger().info(
+            "GraphTimeCentricKimera: Landmark " + std::to_string(lmk_id) +
+            " references marginalized states (slot " + std::to_string(slot) +
+            " no longer exists), skipping update");
+        marginalized_landmarks.push_back(lmk_id);
+      }
+    }
+  }
+  
+  // Clean up landmarks that reference marginalized states
+  for (LandmarkId lmk_id : marginalized_landmarks) {
+    old_smart_stereo_factors_.erase(lmk_id);
+    stereo_feature_tracks_.erase(lmk_id);
+    // Also remove from new_smart_stereo_factors_ to avoid re-adding
+    new_smart_stereo_factors_.erase(lmk_id);
+  }
+  
+  if (!marginalized_landmarks.empty()) {
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera: Removed " + std::to_string(marginalized_landmarks.size()) +
+        " landmark tracks due to marginalization");
   }
   
   // Step 2: Add all other factors (IMU, priors, etc.) after SmartFactors
   for (const auto& factor : new_factors_since_last_opt_) {
     // Skip SmartStereoProjectionPoseFactors since they're already added above
-    // Check if this is a SmartStereoProjectionPoseFactor by attempting dynamic cast
     if (boost::dynamic_pointer_cast<gtsam::SmartStereoProjectionPoseFactor>(factor)) {
       continue;  // Already added in Step 1
     }
     new_factors->push_back(factor);
   }
-  
-  appPtr_->getLogger().info(
-      "GraphTimeCentricKimera::buildIncrementalUpdate: reordered factors - " +
-      std::to_string(new_smart_stereo_factors_.size()) + " SmartFactors first, then " +
-      std::to_string(new_factors->size() - new_smart_stereo_factors_.size()) + " other factors");
 
-  *new_values = new_values_since_last_opt_;
+  if (new_factors->empty() && new_values_since_last_opt_.empty()) {
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: no new factors/values since last opt");
+    return false;
+  }
 
-  for (const auto& [key, timestamp] : new_key_timestamps_since_last_opt_) {
-    (*new_timestamps)[key] = timestamp;
+  // Step 3: Populate output values, filtering out keys already in the smoother
+  // This prevents the "ValuesKeyAlreadyExists" error
+  keys_to_finalize_.clear();
+  for (auto it = new_values_since_last_opt_.begin(); it != new_values_since_last_opt_.end(); ++it) {
+    if (keys_sent_to_smoother_.find(it->key) == keys_sent_to_smoother_.end()) {
+      new_values->insert(it->key, it->value);
+      keys_to_finalize_.insert(it->key);
+    }
+  }
+
+  // Optimization: Only send timestamps for keys that are actually new in this cycle.
+  // GTSAM's FixedLagSmoother only requires timestamps for keys that are NOT yet 
+  // in the smoother. Our keys_to_finalize_ identifies exactly those keys.
+  for (gtsam::Key key : keys_to_finalize_) {
+    auto new_ts_it = new_key_timestamps_since_last_opt_.find(key);
+    if (new_ts_it != new_key_timestamps_since_last_opt_.end()) {
+      (*new_timestamps)[key] = new_ts_it->second;
+    } else {
+      auto ts_it = keyTimestampMap_.find(key);
+      if (ts_it != keyTimestampMap_.end()) {
+        (*new_timestamps)[key] = ts_it->second;
+      } else {
+        appPtr_->getLogger().warn(
+            "GraphTimeCentricKimera::buildIncrementalUpdate: "
+            "Key " + gtsam::DefaultKeyFormatter(key) +
+            " needs timestamp but not found in either staging or cumulative map");
+      }
+    }
   }
   
   // Populate delete_slots with SmartFactor slots that need to be replaced
+  // Pass smoother_graph to enable proper marginalization checking
   if (delete_slots) {
-    auto slots_to_delete = getSmartFactorSlotsToDelete();
+    std::vector<LandmarkId> marginalized_in_delete;
+    auto slots_to_delete = getSmartFactorSlotsToDelete(smoother_graph, &marginalized_in_delete);
     *delete_slots = gtsam::FactorIndices(slots_to_delete.begin(), slots_to_delete.end());
+    
+    // Clean up any additional landmarks detected during delete_slots computation
+    for (LandmarkId lmk_id : marginalized_in_delete) {
+      old_smart_stereo_factors_.erase(lmk_id);
+      stereo_feature_tracks_.erase(lmk_id);
+    }
     
     if (!delete_slots->empty()) {
       appPtr_->getLogger().info(
@@ -861,15 +975,34 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     }
   }
 
+  // Log detailed summary of what's being sent to the smoother
+  appPtr_->getLogger().info(
+      std::string("GraphTimeCentricKimera::buildIncrementalUpdate: SENDING TO SMOOTHER - ") +
+      "factors=" + std::to_string(new_factors->size()) +
+      ", values=" + std::to_string(new_values->size()) +
+      ", timestamps=" + std::to_string(new_timestamps->size()) +
+      ", delete_slots=" + std::to_string(delete_slots ? delete_slots->size() : 0));
+  
+  if (!new_values->empty()) {
+    std::stringstream new_keys_ss;
+    for (const auto& kv : *new_values) {
+      new_keys_ss << gtsam::DefaultKeyFormatter(kv.key) << " ";
+    }
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera::buildIncrementalUpdate: New keys being sent to smoother: " + new_keys_ss.str());
+  }
+
   return true;
 }
 
-std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactorSlotsToDelete() {
+std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactorSlotsToDelete(
+    const gtsam::NonlinearFactorGraph* smoother_graph,
+    std::vector<LandmarkId>* landmarks_to_remove) {
   std::vector<Slot> slots_to_delete;
   slots_to_delete.reserve(new_smart_stereo_factors_.size());
 
-  // Mirrors VioBackend::optimize():
-  // For each updated smart factor, delete the slot of the old factor if it still
+  // Mirrors Kimera-VIO VioBackend::optimize():
+  // For each updated smart factor, delete the slot of the old factor ONLY if it still
   // exists in the smoother graph. If it no longer exists, it was marginalized out
   // and we should drop it from tracking without deleting anything.
   for (const auto& [lmk_id, /*new_factor*/ _] : new_smart_stereo_factors_) {
@@ -884,15 +1017,17 @@ std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactor
       continue;
     }
 
-    // SAFETY: only delete if factor still exists in the current graph.
-    // If it doesn't, it was already marginalized out.
-    const size_t slot_idx = static_cast<size_t>(slot);
-    const bool slot_exists = (slot_idx < this->size()) && (this->at(slot_idx) != nullptr);
-    if (slot_exists) {
+    // CRITICAL CHECK: Only delete if factor still exists in smoother
+    if (smoother_graph && smoother_graph->exists(slot)) {
+      slots_to_delete.push_back(slot);
+    } else if (!smoother_graph) {
+      // No smoother graph provided - assume exists (backward compatibility)
       slots_to_delete.push_back(slot);
     } else {
-      // Clean tracking entry; the factor is gone.
-      old_smart_stereo_factors_.erase(old_it);
+      // Factor was marginalized - track for cleanup
+      if (landmarks_to_remove) {
+        landmarks_to_remove->push_back(lmk_id);
+      }
     }
   }
 
@@ -900,12 +1035,40 @@ std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactor
 }
 
 void GraphTimeCentricKimera::finalizeIncrementalUpdate() {
+  appPtr_->getLogger().info(
+      std::string("GraphTimeCentricKimera::finalizeIncrementalUpdate: ENTERING - ") +
+      "keys_to_finalize_=" + std::to_string(keys_to_finalize_.size()) +
+      ", keys_sent_to_smoother_=" + std::to_string(keys_sent_to_smoother_.size()) +
+      ", new_values_since_last_opt_=" + std::to_string(new_values_since_last_opt_.size()));
+  
+  // 1. Clear factors that were just sent
   new_factors_since_last_opt_.resize(0);
-  new_values_since_last_opt_.clear();
-  new_key_timestamps_since_last_opt_.clear();
+  
   // Clear new_smart_stereo_factors_ as they've been added to the graph
   // The old_smart_stereo_factors_ still tracks them with their slot numbers
   new_smart_stereo_factors_.clear();
+
+  // 2. Mark values as sent and remove them from incremental buffer
+  std::stringstream finalized_keys_ss;
+  for (gtsam::Key key : keys_to_finalize_) {
+    keys_sent_to_smoother_.insert(key);
+    finalized_keys_ss << gtsam::DefaultKeyFormatter(key) << " ";
+    
+    // Remove from staging buffers if they exist there
+    if (new_values_since_last_opt_.exists(key)) {
+      new_values_since_last_opt_.erase(key);
+    }
+    new_key_timestamps_since_last_opt_.erase(key);
+  }
+  
+  appPtr_->getLogger().info(
+      "GraphTimeCentricKimera::finalizeIncrementalUpdate: Finalized keys: " + finalized_keys_ss.str());
+  
+  keys_to_finalize_.clear();
+  
+  appPtr_->getLogger().info(
+      "GraphTimeCentricKimera: finalized incremental update, " +
+      std::to_string(keys_sent_to_smoother_.size()) + " total keys now in smoother.");
 }
 
 // ========================================================================
@@ -1033,9 +1196,21 @@ size_t GraphTimeCentricKimera::cleanCheiralityLandmarks(
 
   // 3) Delete from current (smoother) graph all factors that touch this key.
   *delete_slots_out = delete_slots;
-  std::vector<size_t> extra_slots;
-  findSlotsOfFactorsWithKey(lmk_key, graph_in_smoother, &extra_slots);
-  delete_slots_out->insert(delete_slots_out->end(), extra_slots.begin(), extra_slots.end());
+  
+  // Optimization: Instead of searching the whole graph, use our tracked slot.
+  auto factor_it = old_smart_stereo_factors_.find(lmk_id);
+  if (factor_it != old_smart_stereo_factors_.end()) {
+    Slot slot = factor_it->second.second;
+    if (slot != -1) {
+      // Check if this slot is already in delete_slots_out to avoid duplicates
+      if (std::find(delete_slots_out->begin(), delete_slots_out->end(), slot) == delete_slots_out->end()) {
+        delete_slots_out->push_back(slot);
+        appPtr_->getLogger().info(
+            "GraphTimeCentricKimera::cleanCheiralityLandmarks: adding tracked slot " + 
+            std::to_string(slot) + " for removal");
+      }
+    }
+  }
 
   // 4) Bookkeeping: remove from our smart-factor tracking.
   removeLandmark(lmk_id);
@@ -1043,8 +1218,7 @@ size_t GraphTimeCentricKimera::cleanCheiralityLandmarks(
   appPtr_->getLogger().warn(
       "GraphTimeCentricKimera::cleanCheiralityLandmarks: removed landmark " +
       std::to_string(lmk_id) + " (symbol=" + std::string(1, lmk_symbol.chr()) +
-      std::to_string(lmk_symbol.index()) + "), extra_delete_slots=" +
-      std::to_string(extra_slots.size()));
+      std::to_string(lmk_symbol.index()) + ")");
 
   return 1;
 }
@@ -1105,25 +1279,38 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
       values_.update(pose_key, predicted_state.state.pose());
     } else {
       values_.insert(pose_key, predicted_state.state.pose());
-      new_values_since_last_opt_.insert(pose_key, predicted_state.state.pose());
-      new_key_timestamps_since_last_opt_[pose_key] = timestamp;
     }
+    // ALWAYS stage for the next optimization to ensure smoother has the latest values
+    if (new_values_since_last_opt_.exists(pose_key)) {
+      new_values_since_last_opt_.update(pose_key, predicted_state.state.pose());
+    } else {
+      new_values_since_last_opt_.insert(pose_key, predicted_state.state.pose());
+    }
+    new_key_timestamps_since_last_opt_[pose_key] = timestamp;
     
     if (values_.exists(vel_key)) {
       values_.update(vel_key, predicted_state.state.velocity());
     } else {
       values_.insert(vel_key, predicted_state.state.velocity());
-      new_values_since_last_opt_.insert(vel_key, predicted_state.state.velocity());
-      new_key_timestamps_since_last_opt_[vel_key] = timestamp;
     }
+    if (new_values_since_last_opt_.exists(vel_key)) {
+      new_values_since_last_opt_.update(vel_key, predicted_state.state.velocity());
+    } else {
+      new_values_since_last_opt_.insert(vel_key, predicted_state.state.velocity());
+    }
+    new_key_timestamps_since_last_opt_[vel_key] = timestamp;
     
     if (values_.exists(bias_key)) {
       values_.update(bias_key, predicted_state.imuBias);
     } else {
       values_.insert(bias_key, predicted_state.imuBias);
-      new_values_since_last_opt_.insert(bias_key, predicted_state.imuBias);
-      new_key_timestamps_since_last_opt_[bias_key] = timestamp;
     }
+    if (new_values_since_last_opt_.exists(bias_key)) {
+      new_values_since_last_opt_.update(bias_key, predicted_state.imuBias);
+    } else {
+      new_values_since_last_opt_.insert(bias_key, predicted_state.imuBias);
+    }
+    new_key_timestamps_since_last_opt_[bias_key] = timestamp;
     
     // Update keyTimestampMap
     keyTimestampMap_[pose_key] = timestamp;
@@ -1133,9 +1320,8 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
     // Update currentKeyIndexTimestampMap_
     currentKeyIndexTimestampMap_.insert(std::make_pair(state_idx, timestamp));
     
-        // GP FACTORS - COMMENTED OUT FOR IMU ISOLATION TESTING
         
-        // If GP factors enabled, also insert omega and acc keys
+        // If GP factors enabled, also insert omega keys
         if (kimeraParams_.addGPMotionPriors) {
           gtsam::Key omega_key = W(state_idx);
           values_.insert(omega_key, predicted_state.omega);
@@ -1143,16 +1329,23 @@ bool GraphTimeCentricKimera::createInitialValuesForState(size_t state_idx, doubl
           keyTimestampMap_[omega_key] = timestamp;
           new_key_timestamps_since_last_opt_[omega_key] = timestamp;
           
-          gtsam::Key acc_key = A(state_idx);
-          // Get acceleration from buffer if available, otherwise use zero
-          gtsam::Vector6 acc = gtsam::Vector6::Zero();
-          if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
-            acc = accBuffer_.get_buffer_from_id(state_idx - 1);
+          // Only create acceleration keys for Full GP variants
+          // where acceleration is an optimization variable (WNOJFull, SingerFull)
+          // not for standard variants (WNOA, WNOJ, Singer) where acceleration
+          // is computed internally
+          if (kimeraParams_.gpType == fgo::data::GPModelType::WNOJFull ||
+              kimeraParams_.gpType == fgo::data::GPModelType::SingerFull) {
+            gtsam::Key acc_key = A(state_idx);
+            // Get acceleration from buffer if available, otherwise use zero
+            gtsam::Vector6 acc = gtsam::Vector6::Zero();
+            if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
+              acc = accBuffer_.get_buffer_from_id(state_idx - 1);
+            }
+            values_.insert(acc_key, acc);
+            new_values_since_last_opt_.insert(acc_key, acc);
+            keyTimestampMap_[acc_key] = timestamp;
+            new_key_timestamps_since_last_opt_[acc_key] = timestamp;
           }
-          values_.insert(acc_key, acc);
-          new_values_since_last_opt_.insert(acc_key, acc);
-          keyTimestampMap_[acc_key] = timestamp;
-          new_key_timestamps_since_last_opt_[acc_key] = timestamp;
         }    
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Created initial values for state " +
                                std::to_string(state_idx) + " at timestamp " +
@@ -1181,56 +1374,107 @@ bool GraphTimeCentricKimera::setStateInitialValues(size_t state_idx,
     gtsam::Key vel_key = V(state_idx);
     gtsam::Key bias_key = B(state_idx);
     
-    // CRITICAL: Insert PIM-predicted initial values directly into both data structures.
-    // For Kimera integration, createInitialValuesForState() is skipped (buffer is empty),
-    // so this function now does the initial insertion with correct values from VioBackend.
+    // Update or insert into values_
     if (values_.exists(pose_key)) {
-      // Update case: state was created by a previous call or bootstrap
       values_.update(pose_key, pose);
-      if (new_values_since_last_opt_.exists(pose_key)) {
-        new_values_since_last_opt_.update(pose_key, pose);
-      } else {
-        new_values_since_last_opt_.insert(pose_key, pose);
-      }
     } else {
-      // Insert case: fresh state, insert into both data structures
       values_.insert(pose_key, pose);
+    }
+
+    // ALWAYS stage for the next optimization to ensure smoother has the latest values.
+    // FixedLagSmoother is fine with updates to existing keys.
+    if (new_values_since_last_opt_.exists(pose_key)) {
+      new_values_since_last_opt_.update(pose_key, pose);
+    } else {
       new_values_since_last_opt_.insert(pose_key, pose);
-      if (keyTimestampMap_.find(pose_key) != keyTimestampMap_.end()) {
-        new_key_timestamps_since_last_opt_[pose_key] = keyTimestampMap_[pose_key];
-      }
     }
     
+    // Always ensure timestamp is staged
+    if (keyTimestampMap_.find(pose_key) != keyTimestampMap_.end()) {
+      new_key_timestamps_since_last_opt_[pose_key] = keyTimestampMap_[pose_key];
+    }
+
     if (values_.exists(vel_key)) {
       values_.update(vel_key, velocity);
-      if (new_values_since_last_opt_.exists(vel_key)) {
-        new_values_since_last_opt_.update(vel_key, velocity);
-      } else {
-        new_values_since_last_opt_.insert(vel_key, velocity);
-      }
     } else {
       values_.insert(vel_key, velocity);
-      new_values_since_last_opt_.insert(vel_key, velocity);
-      if (keyTimestampMap_.find(vel_key) != keyTimestampMap_.end()) {
-        new_key_timestamps_since_last_opt_[vel_key] = keyTimestampMap_[vel_key];
-      }
     }
-    
+    if (new_values_since_last_opt_.exists(vel_key)) {
+      new_values_since_last_opt_.update(vel_key, velocity);
+    } else {
+      new_values_since_last_opt_.insert(vel_key, velocity);
+    }
+    if (keyTimestampMap_.find(vel_key) != keyTimestampMap_.end()) {
+      new_key_timestamps_since_last_opt_[vel_key] = keyTimestampMap_[vel_key];
+    }
+
     if (values_.exists(bias_key)) {
       values_.update(bias_key, bias);
-      if (new_values_since_last_opt_.exists(bias_key)) {
-        new_values_since_last_opt_.update(bias_key, bias);
-      } else {
-        new_values_since_last_opt_.insert(bias_key, bias);
-      }
     } else {
       values_.insert(bias_key, bias);
+    }
+    if (new_values_since_last_opt_.exists(bias_key)) {
+      new_values_since_last_opt_.update(bias_key, bias);
+    } else {
       new_values_since_last_opt_.insert(bias_key, bias);
-      if (keyTimestampMap_.find(bias_key) != keyTimestampMap_.end()) {
-        new_key_timestamps_since_last_opt_[bias_key] = keyTimestampMap_[bias_key];
-      }
+    }
+    if (keyTimestampMap_.find(bias_key) != keyTimestampMap_.end()) {
+      new_key_timestamps_since_last_opt_[bias_key] = keyTimestampMap_[bias_key];
     }
     
+    // If GP motion priors are enabled, we need to ensure omega keys are updated.
+    // Acceleration keys are ONLY needed for Full GP variants.
+    if (kimeraParams_.addGPMotionPriors) {
+      gtsam::Key omega_key = W(state_idx);
+
+      // We might have omega from setOmegaForState (state_omega_ map)
+      gtsam::Vector3 omega = gtsam::Vector3::Zero();
+      if (state_omega_.find(state_idx) != state_omega_.end()) {
+        omega = state_omega_[state_idx].omega;
+      }
+
+      if (values_.exists(omega_key)) {
+        values_.update(omega_key, omega);
+      } else {
+        values_.insert(omega_key, omega);
+      }
+      if (new_values_since_last_opt_.exists(omega_key)) {
+        new_values_since_last_opt_.update(omega_key, omega);
+      } else {
+        new_values_since_last_opt_.insert(omega_key, omega);
+      }
+      if (keyTimestampMap_.find(omega_key) != keyTimestampMap_.end()) {
+        new_key_timestamps_since_last_opt_[omega_key] = keyTimestampMap_[omega_key];
+      }
+
+      // Only handle acceleration keys for Full GP variants where acceleration
+      // is an optimization variable (WNOJFull, SingerFull)
+      if (kimeraParams_.gpType == fgo::data::GPModelType::WNOJFull ||
+          kimeraParams_.gpType == fgo::data::GPModelType::SingerFull) {
+        gtsam::Key acc_key = A(state_idx);
+        
+        // Acceleration (for Full GP variants)
+        gtsam::Vector6 acc = gtsam::Vector6::Zero();
+        if (state_idx > 0 && accBuffer_.size() > (state_idx - 1)) {
+           acc = accBuffer_.get_buffer_from_id(state_idx - 1);
+        }
+
+        if (values_.exists(acc_key)) {
+          values_.update(acc_key, acc);
+        } else {
+          values_.insert(acc_key, acc);
+        }
+        if (new_values_since_last_opt_.exists(acc_key)) {
+          new_values_since_last_opt_.update(acc_key, acc);
+        } else {
+          new_values_since_last_opt_.insert(acc_key, acc);
+        }
+        if (keyTimestampMap_.find(acc_key) != keyTimestampMap_.end()) {
+          new_key_timestamps_since_last_opt_[acc_key] = keyTimestampMap_[acc_key];
+        }
+      }
+    }
+
     appPtr_->getLogger().debug("GraphTimeCentricKimera: Set initial values for state " + 
                                std::to_string(state_idx) + 
                                " - pose: [" + std::to_string(pose.translation().x()) + ", " +
@@ -1309,16 +1553,39 @@ bool GraphTimeCentricKimera::addPriorFactorsToFirstState(size_t state_idx, doubl
     
     // Create and add prior factors (matching Kimera-VIO's addInitialPriorFactors)
     auto prior_pose = gtsam::PriorFactor<gtsam::Pose3>(pose_key, pose, noise_init_pose);
-    this->push_back(prior_pose);
+    // this->push_back(prior_pose); // Disabled for Stateless GTC
     new_factors_since_last_opt_.push_back(prior_pose);
     
     auto prior_vel = gtsam::PriorFactor<gtsam::Vector3>(vel_key, velocity, noise_init_vel_prior);
-    this->push_back(prior_vel);
+    // this->push_back(prior_vel); // Disabled for Stateless GTC
     new_factors_since_last_opt_.push_back(prior_vel);
     
     auto prior_bias = gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(bias_key, bias, imu_bias_prior_noise);
-    this->push_back(prior_bias);
+    // this->push_back(prior_bias); // Disabled for Stateless GTC
     new_factors_since_last_opt_.push_back(prior_bias);
+
+    // If GP priors are enabled, we also need to add priors for omega and acceleration
+    // to ensure the first state is fully constrained.
+    if (kimeraParams_.addGPMotionPriors) {
+      gtsam::Key omega_key = W(state_idx);
+      gtsam::Key acc_key = A(state_idx);
+
+      if (values_.exists(omega_key)) {
+        gtsam::Vector3 omega = values_.at<gtsam::Vector3>(omega_key);
+        // Use a weak prior for omega (e.g., 0.1 rad/s)
+        auto noise_omega = gtsam::noiseModel::Isotropic::Sigma(3, 0.1);
+        new_factors_since_last_opt_.push_back(
+            gtsam::PriorFactor<gtsam::Vector3>(omega_key, omega, noise_omega));
+      }
+
+      if (values_.exists(acc_key)) {
+        gtsam::Vector6 acc = values_.at<gtsam::Vector6>(acc_key);
+        // Use a weak prior for acceleration (e.g., 0.1 m/s^2)
+        auto noise_acc = gtsam::noiseModel::Isotropic::Sigma(6, 0.1);
+        new_factors_since_last_opt_.push_back(
+            gtsam::PriorFactor<gtsam::Vector6>(acc_key, acc, noise_acc));
+      }
+    }
 
     appPtr_->getLogger().info(
         "GraphTimeCentricKimera::addPriorFactorsToFirstState: added 3 priors, "
@@ -1518,14 +1785,12 @@ bool GraphTimeCentricKimera::addStereoLandmarkToGraph(
     }
     
     // Store in new smart factors (to be added to graph during optimization)
+    // Note: SmartFactors are handled separately from new_factors_since_last_opt_ 
+    // to allow for explicit slot deletion/replacement in the smoother.
     new_smart_stereo_factors_[lmk_id] = new_factor;
     
     // Also store in old_smart_stereo_factors_ with slot = -1 (not yet in graph)
     old_smart_stereo_factors_[lmk_id] = std::make_pair(new_factor, -1);
-    
-    // Add factor to incremental update
-    this->push_back(new_factor);
-    new_factors_since_last_opt_.push_back(new_factor);
     
     return true;
     
@@ -1553,19 +1818,21 @@ bool GraphTimeCentricKimera::updateStereoLandmarkInGraph(
     const SmartStereoFactorPtr& old_factor = old_it->second.first;
     Slot slot = old_it->second.second;
     
-    // CRITICAL CHECK (mirrors VioBackend::updateLandmarkInGraph):
     // If slot == -1, the factor hasn't been integrated into the graph yet.
-    // This should not happen in normal operation - updateLandmark should only
-    // be called for landmarks that are already in_ba_graph (which means their
-    // factor has been added and slot assigned).
+    // In our Stateless GTC architecture, this happens when multiple updates 
+    // arrive within the same optimization cycle before the smoother has 
+    // assigned a slot. We should just update the pending factor.
     if (slot == -1) {
-      appPtr_->getLogger().error(
-          "GraphTimeCentricKimera: Attempting to update landmark " + 
-          std::to_string(lmk_id) + " but slot is -1 (factor not yet in graph). "
-          "This indicates a logic error - updateStereoLandmarkInGraph should only "
-          "be called for landmarks already integrated into the graph.");
-      // Don't fatal like VioBackend, but log error and return false
-      return false;
+      appPtr_->getLogger().debug("GraphTimeCentricKimera: Landmark " + std::to_string(lmk_id) + 
+                               " is pending addition (slot -1), updating pre-optimization.");
+      
+      SmartStereoFactorPtr new_factor = boost::make_shared<gtsam::SmartStereoProjectionPoseFactor>(*old_factor);
+      const gtsam::Symbol pose_symbol('x', frame_id);
+      new_factor->add(measurement, pose_symbol, stereo_cal_);
+      
+      new_smart_stereo_factors_[lmk_id] = new_factor;
+      old_it->second.first = new_factor;
+      return true;
     }
     
     // Clone old factor and add new observation (mirrors VioBackend::updateLandmarkInGraph)
@@ -1581,10 +1848,6 @@ bool GraphTimeCentricKimera::updateStereoLandmarkInGraph(
     // Update old_smart_stereo_factors_ to point to new factor (slot will be updated after optimization)
     old_it->second.first = new_factor;
     
-    // Add factor to incremental update (separate tracking for non-SmartFactors)
-    // Note: SmartFactors are added separately via new_smart_stereo_factors_
-    this->push_back(new_factor);
-    new_factors_since_last_opt_.push_back(new_factor);
     return true;
     
   } catch (const std::exception& e) {
@@ -1625,6 +1888,29 @@ void GraphTimeCentricKimera::updateSmartFactorSlots(
       "GraphTimeCentricKimera: Updated slots for " + 
       std::to_string(lmk_ids.size()) + " SmartFactors");
 }
+
+void GraphTimeCentricKimera::removeLandmarkTrack(LandmarkId lmk_id) {
+  // Remove from feature tracks
+  auto track_it = stereo_feature_tracks_.find(lmk_id);
+  if (track_it != stereo_feature_tracks_.end()) {
+    appPtr_->getLogger().info("GraphTimeCentricKimera: Removing landmark track " + 
+                              std::to_string(lmk_id) + " (references marginalized state)");
+    stereo_feature_tracks_.erase(track_it);
+  }
+  
+  // Remove from old smart factors
+  auto factor_it = old_smart_stereo_factors_.find(lmk_id);
+  if (factor_it != old_smart_stereo_factors_.end()) {
+    old_smart_stereo_factors_.erase(factor_it);
+  }
+  
+  // Also remove from new smart factors if it's pending
+  auto new_factor_it = new_smart_stereo_factors_.find(lmk_id);
+  if (new_factor_it != new_smart_stereo_factors_.end()) {
+    new_smart_stereo_factors_.erase(new_factor_it);
+  }
+}
+
 
 bool GraphTimeCentricKimera::getCurrentGraphAndValues(
     gtsam::NonlinearFactorGraph& graph,
