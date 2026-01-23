@@ -97,6 +97,13 @@ struct GraphTimeCentricKimeraParams {
   // 0=WNOA, 1=WNOJ, 2=WNOJFull, 3=Singer, 4=SingerFull
   fgo::data::GPModelType gpType = fgo::data::GPModelType::WNOA;
   
+  // Omega measurement prior sigma (rad/s)
+  // Controls tightness of angular velocity measurement constraints
+  // Lower = tighter (more trust in gyro), Higher = looser (better numerical stability)
+  // Typical range: 0.01-0.1 rad/s
+  // NOTE: 0.005 was too tight and caused IndeterminantLinearSystemException during marginalization
+  double omegaMeasurementSigma = 0.05;     // Default: 0.05 rad/s (~2.9°/s)
+  
   // Visual factor configuration
   bool enableSmartFactors = true;          // Enable smart factor management
   size_t smartFactorSlotReserve = 1000;    // Reserve slots for smart factors

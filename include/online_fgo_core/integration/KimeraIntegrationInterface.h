@@ -217,6 +217,7 @@ struct OmegaAtState {
     // The Qc noise model is passed separately via setGPPriorParams (following visual factors pattern)
     bool use_gp_priors = false;           // Enable GP motion priors between consecutive states
     int gp_model_type = 0;                // 0=WNOA, 1=WNOJ, 2=WNOJFull, 3=Singer, 4=SingerFull
+    double omega_measurement_sigma = 0.005;  // rad/s - tightness of omega measurement constraints
     
     // Optimization parameters
     bool optimize_on_keyframe = true;

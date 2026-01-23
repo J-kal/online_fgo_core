@@ -541,17 +541,18 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
     values_.insert(omega_key_i, omega_i.omega);
   }
   
-  // ALWAYS stage for the next optimization to ensure smoother has the latest values
-  if (new_values_since_last_opt_.exists(omega_key_i)) {
-    new_values_since_last_opt_.update(omega_key_i, omega_i.omega);
-  } else {
-    new_values_since_last_opt_.insert(omega_key_i, omega_i.omega);
-  }
-  keyTimestampMap_[omega_key_i] = timestamp_i;
-  // Only add timestamp if key hasn't been sent yet (otherwise causes mismatch with filtered values)
+  // CRITICAL: Stage for the next optimization to ensure smoother has the latest values
+  // For omega keys: they may be updated multiple times before first optimization
+  // Always ensure they're in new_values_since_last_opt_ if not yet in smoother
   if (keys_sent_to_smoother_.find(omega_key_i) == keys_sent_to_smoother_.end()) {
+    if (new_values_since_last_opt_.exists(omega_key_i)) {
+      new_values_since_last_opt_.update(omega_key_i, omega_i.omega);
+    } else {
+      new_values_since_last_opt_.insert(omega_key_i, omega_i.omega);
+    }
     new_key_timestamps_since_last_opt_[omega_key_i] = timestamp_i;
   }
+  keyTimestampMap_[omega_key_i] = timestamp_i;
   
   appPtr_->getLogger().debug("GraphTimeCentricKimera: Added/Updated omega key W(" + 
                              std::to_string(state_i_idx) + ") = [" +
@@ -566,23 +567,79 @@ bool GraphTimeCentricKimera::addGPMotionPrior(
     values_.insert(omega_key_j, omega_j.omega);
   }
   
-  // ALWAYS stage for the next optimization to ensure smoother has the latest values
-  if (new_values_since_last_opt_.exists(omega_key_j)) {
-    new_values_since_last_opt_.update(omega_key_j, omega_j.omega);
-  } else {
-    new_values_since_last_opt_.insert(omega_key_j, omega_j.omega);
-  }
-  keyTimestampMap_[omega_key_j] = timestamp_j;
-  // Only add timestamp if key hasn't been sent yet (otherwise causes mismatch with filtered values)
+  // CRITICAL: Stage for the next optimization to ensure smoother has the latest values
+  // For omega keys: they may be updated multiple times before first optimization
+  // Always ensure they're in new_values_since_last_opt_ if not yet in smoother
   if (keys_sent_to_smoother_.find(omega_key_j) == keys_sent_to_smoother_.end()) {
+    if (new_values_since_last_opt_.exists(omega_key_j)) {
+      new_values_since_last_opt_.update(omega_key_j, omega_j.omega);
+    } else {
+      new_values_since_last_opt_.insert(omega_key_j, omega_j.omega);
+    }
     new_key_timestamps_since_last_opt_[omega_key_j] = timestamp_j;
   }
+  keyTimestampMap_[omega_key_j] = timestamp_j;
   
   appPtr_->getLogger().debug("GraphTimeCentricKimera: Added/Updated omega key W(" + 
                              std::to_string(state_j_idx) + ") = [" +
                              std::to_string(omega_j.omega.x()) + ", " +
                              std::to_string(omega_j.omega.y()) + ", " +
                              std::to_string(omega_j.omega.z()) + "] rad/s");
+  
+  // CRITICAL FIX: Add STRONG UNARY MEASUREMENT factors on omega variables
+  // IMU gyroscope provides DIRECT MEASUREMENTS of bias-corrected angular velocity
+  // These are actual sensor observations that strongly constrain omega variables
+  // 
+  // Noise model calculation:
+  // - Gyroscope noise density σ_g ≈ 0.00016968 rad/s/√Hz (from ImuParams.yaml)
+  // - At IMU rate f = 200Hz: discrete-time sigma = σ_g * sqrt(f) ≈ 0.0024 rad/s
+  // - BUT: This is for individual IMU measurements, not keyframe-boundary values
+  // - At keyframe boundaries (5Hz, dt=0.2s): effective sigma = σ_g * sqrt(1/dt) ≈ 0.0038 rad/s
+  // 
+  // Using conservative sigma = 0.005 rad/s (~0.29°/s) provides strong constraint
+  // while accounting for interpolation uncertainty at keyframe boundaries.
+  // This is MUCH stronger than typical motion model uncertainty (~0.1 rad/s).
+  
+  // IMPORTANT: Only add measurement factors when keys are NEW to avoid double-counting
+  // Once a key is in the smoother, the IMU factor already constrains its omega via PIM
+  
+  gtsam::Vector3 omega_measurement_sigmas;
+  // Use configurable sigma from kimeraParams_ (loaded from BackendParams.yaml)
+  omega_measurement_sigmas << kimeraParams_.omegaMeasurementSigma, 
+                              kimeraParams_.omegaMeasurementSigma, 
+                              kimeraParams_.omegaMeasurementSigma;
+  
+  // Add measurement factor for omega_i only if it's a NEW key
+  if (keys_sent_to_smoother_.find(omega_key_i) == keys_sent_to_smoother_.end()) {
+    auto omega_i_measurement_noise = gtsam::noiseModel::Diagonal::Sigmas(omega_measurement_sigmas);
+    auto omega_i_measurement_factor = boost::make_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+        omega_key_i, omega_i.omega, omega_i_measurement_noise);
+    
+    new_factors_since_last_opt_.push_back(omega_i_measurement_factor);
+    
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega measurement factor W(" + 
+                               std::to_string(state_i_idx) + ") = [" +
+                               std::to_string(omega_i.omega.x()) + ", " +
+                               std::to_string(omega_i.omega.y()) + ", " +
+                               std::to_string(omega_i.omega.z()) + "] ± " +
+                               std::to_string(kimeraParams_.omegaMeasurementSigma) + " rad/s (from IMU gyro)");
+  }
+  
+  // Add measurement factor for omega_j only if it's a NEW key
+  if (keys_sent_to_smoother_.find(omega_key_j) == keys_sent_to_smoother_.end()) {
+    auto omega_j_measurement_noise = gtsam::noiseModel::Diagonal::Sigmas(omega_measurement_sigmas);
+    auto omega_j_measurement_factor = boost::make_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+        omega_key_j, omega_j.omega, omega_j_measurement_noise);
+    
+    new_factors_since_last_opt_.push_back(omega_j_measurement_factor);
+    
+    appPtr_->getLogger().debug("GraphTimeCentricKimera: Added omega measurement factor W(" + 
+                               std::to_string(state_j_idx) + ") = [" +
+                               std::to_string(omega_j.omega.x()) + ", " +
+                               std::to_string(omega_j.omega.y()) + ", " +
+                               std::to_string(omega_j.omega.z()) + "] ± " +
+                               std::to_string(kimeraParams_.omegaMeasurementSigma) + " rad/s (from IMU gyro)");
+  }
   
   // Create GP motion prior based on gpType
   std::string gp_type_name;
@@ -935,9 +992,25 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     }
   }
 
-  // Optimization: Only send timestamps for keys that are actually new in this cycle.
-  // GTSAM's FixedLagSmoother only requires timestamps for keys that are NOT yet 
-  // in the smoother. Our keys_to_finalize_ identifies exactly those keys.
+  // CRITICAL FIX: Send timestamps for ALL keys that are new OR referenced by new factors
+  // GTSAM's FixedLagSmoother requires timestamps for ALL keys to enable marginalization.
+  // Previously, we only sent timestamps for keys_to_finalize_, which missed omega keys
+  // that were updated in place (not in new_values but needed by GP prior factors).
+  
+  // Collect all keys referenced by new factors (including omega keys from GP priors)
+  std::set<gtsam::Key> all_keys_in_new_factors;
+  for (const auto& factor : *new_factors) {
+    if (factor) {
+      for (const auto& key : factor->keys()) {
+        all_keys_in_new_factors.insert(key);
+      }
+    }
+  }
+  
+  // Send timestamps for:
+  // 1. Keys in new_values (keys_to_finalize_)
+  // 2. Keys referenced by new factors but not in smoother yet
+  // 3. Keys that need timestamp updates (omega keys for GP priors)
   for (gtsam::Key key : keys_to_finalize_) {
     auto new_ts_it = new_key_timestamps_since_last_opt_.find(key);
     if (new_ts_it != new_key_timestamps_since_last_opt_.end()) {
@@ -946,11 +1019,27 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
       auto ts_it = keyTimestampMap_.find(key);
       if (ts_it != keyTimestampMap_.end()) {
         (*new_timestamps)[key] = ts_it->second;
+      }
+    }
+  }
+  
+  // Add timestamps for keys in factors that aren't being sent as new values
+  // (e.g., omega keys that were updated in place)
+  for (gtsam::Key key : all_keys_in_new_factors) {
+    // Only add if not already in new_timestamps and not already in smoother
+    if (new_timestamps->find(key) == new_timestamps->end() &&
+        keys_sent_to_smoother_.find(key) == keys_sent_to_smoother_.end()) {
+      auto ts_it = keyTimestampMap_.find(key);
+      if (ts_it != keyTimestampMap_.end()) {
+        (*new_timestamps)[key] = ts_it->second;
+        appPtr_->getLogger().debug(
+            "GraphTimeCentricKimera: Adding timestamp for factor-referenced key " +
+            gtsam::DefaultKeyFormatter(key) + " = " + std::to_string(ts_it->second));
       } else {
         appPtr_->getLogger().warn(
             "GraphTimeCentricKimera::buildIncrementalUpdate: "
-            "Key " + gtsam::DefaultKeyFormatter(key) +
-            " needs timestamp but not found in either staging or cumulative map");
+            "Factor references key " + gtsam::DefaultKeyFormatter(key) +
+            " but timestamp not found in keyTimestampMap_");
       }
     }
   }
@@ -961,6 +1050,46 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
     std::vector<LandmarkId> marginalized_in_delete;
     auto slots_to_delete = getSmartFactorSlotsToDelete(smoother_graph, &marginalized_in_delete);
     *delete_slots = gtsam::FactorIndices(slots_to_delete.begin(), slots_to_delete.end());
+    
+    // DEFENSIVE CHECK: Ensure GP factors and omega priors are never in delete_slots
+    // These factors should ONLY be marginalized (like IMU factors), never explicitly deleted
+    if (!delete_slots->empty() && smoother_graph) {
+      std::vector<Slot> slots_to_remove_from_deletion;
+      for (Slot slot : *delete_slots) {
+        if (smoother_graph->exists(slot)) {
+          auto factor = smoother_graph->at(slot);
+          if (factor) {
+            // Check if this is a GP prior
+            auto gp_wnoa = boost::dynamic_pointer_cast<fgo::factor::GPWNOAPrior>(factor);
+            auto gp_wnoj = boost::dynamic_pointer_cast<fgo::factor::GPWNOJPrior>(factor);
+            auto gp_singer = boost::dynamic_pointer_cast<fgo::factor::GPSingerPrior>(factor);
+            
+            // Check if this is an omega measurement prior (PriorFactor<Vector3> on W key)
+            auto omega_prior = boost::dynamic_pointer_cast<gtsam::PriorFactor<gtsam::Vector3>>(factor);
+            bool is_omega_prior = false;
+            if (omega_prior && !omega_prior->keys().empty()) {
+              gtsam::Key key = omega_prior->keys()[0];
+              // Omega keys use symbol 'W'
+              is_omega_prior = (gtsam::Symbol(key).chr() == 'W');
+            }
+            
+            if (gp_wnoa || gp_wnoj || gp_singer || is_omega_prior) {
+              appPtr_->getLogger().error(
+                  std::string("CRITICAL: GP factor or omega prior in delete_slots! Slot=") + 
+                  std::to_string(slot) + " - Removing from delete_slots (should only be marginalized)");
+              slots_to_remove_from_deletion.push_back(slot);
+            }
+          }
+        }
+      }
+      
+      // Remove GP factors from delete_slots
+      for (Slot slot : slots_to_remove_from_deletion) {
+        delete_slots->erase(
+            std::remove(delete_slots->begin(), delete_slots->end(), slot),
+            delete_slots->end());
+      }
+    }
     
     // Clean up any additional landmarks detected during delete_slots computation
     for (LandmarkId lmk_id : marginalized_in_delete) {

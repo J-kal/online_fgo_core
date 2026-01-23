@@ -123,6 +123,7 @@ bool KimeraIntegrationInterface::initialize(const KimeraIntegrationParams& param
     // GP motion prior configuration (Qc noise model is passed separately via setGPPriorParams)
     kimera_params.addGPMotionPriors = params.use_gp_priors;
     kimera_params.gpType = static_cast<fgo::data::GPModelType>(params.gp_model_type);
+    kimera_params.omegaMeasurementSigma = params.omega_measurement_sigma;
     kimera_params.optimizeOnKeyframe = params.optimize_on_keyframe;
     
     app_->getLogger().info("KimeraIntegrationInterface: IMU preintegration type = " + 
