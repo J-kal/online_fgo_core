@@ -557,6 +557,15 @@ struct OmegaAtState {
      * from being sent again in the next cycle.
      */
     void finalizeIncrementalUpdate();
+    
+    /**
+     * @brief Update marginalized key tracking after smoother optimization
+     * @param current_smoother_keys Keys currently in the smoother after update
+     * 
+     * Updates internal tracking to remove keys that have been marginalized.
+     * Should be called after smoother->update() with smoother->timestamps() keys.
+     */
+    void updateMarginalizedKeys(const std::set<gtsam::Key>& current_smoother_keys);
 
     /**
      * @brief Build incremental update packet for external smoother

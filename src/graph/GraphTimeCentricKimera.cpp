@@ -1097,6 +1097,39 @@ bool GraphTimeCentricKimera::buildIncrementalUpdate(
       stereo_feature_tracks_.erase(lmk_id);
     }
     
+    // CRITICAL FIX: Clean up all SmartFactor mappings where the slot no longer exists
+    // This prevents stale slot tracking when GTSAM reuses slot numbers
+    if (smoother_graph) {
+      std::vector<LandmarkId> stale_landmarks;
+      for (const auto& [lmk_id, factor_slot_pair] : old_smart_stereo_factors_) {
+        const Slot slot = factor_slot_pair.second;
+        const auto& factor_ptr = factor_slot_pair.first;
+        
+        if (slot != -1 && !smoother_graph->exists(slot)) {
+          // Slot no longer exists - factor was deleted/marginalized
+          stale_landmarks.push_back(lmk_id);
+        } else if (slot != -1 && smoother_graph->exists(slot)) {
+          // Slot exists - verify it's still our factor
+          auto current_factor = smoother_graph->at(slot);
+          if (!current_factor || current_factor.get() != factor_ptr.get()) {
+            // Different factor at this slot - ours was replaced
+            stale_landmarks.push_back(lmk_id);
+          }
+        }
+      }
+      
+      for (LandmarkId lmk_id : stale_landmarks) {
+        old_smart_stereo_factors_.erase(lmk_id);
+        stereo_feature_tracks_.erase(lmk_id);
+      }
+      
+      if (!stale_landmarks.empty()) {
+        appPtr_->getLogger().info(
+            "GraphTimeCentricKimera: Cleaned up " + std::to_string(stale_landmarks.size()) +
+            " stale SmartFactor mappings");
+      }
+    }
+    
     if (!delete_slots->empty()) {
       appPtr_->getLogger().info(
           "GraphTimeCentricKimera::buildIncrementalUpdate: " +
@@ -1128,8 +1161,9 @@ std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactor
     const gtsam::NonlinearFactorGraph* smoother_graph,
     std::vector<LandmarkId>* landmarks_to_remove) {
   std::vector<Slot> slots_to_delete;
-  slots_to_delete.reserve(new_smart_stereo_factors_.size());
+  slots_to_delete.reserve(new_smart_stereo_factors_.size() + marginalized_keys_.size());
 
+  // PART 1: Delete slots for updated smart factors (existing logic)
   // Mirrors Kimera-VIO VioBackend::optimize():
   // For each updated smart factor, delete the slot of the old factor ONLY if it still
   // exists in the smoother graph. If it no longer exists, it was marginalized out
@@ -1156,6 +1190,50 @@ std::vector<GraphTimeCentricKimera::Slot> GraphTimeCentricKimera::getSmartFactor
       // Factor was marginalized - track for cleanup
       if (landmarks_to_remove) {
         landmarks_to_remove->push_back(lmk_id);
+      }
+    }
+  }
+
+  // PART 2: Delete slots for SmartFactors that reference marginalized keys
+  // This is the missing piece that causes linear factor growth
+  if (smoother_graph && !marginalized_keys_.empty()) {
+    for (const auto& [lmk_id, factor_slot_pair] : old_smart_stereo_factors_) {
+      const auto& factor = factor_slot_pair.first;
+      const Slot slot = factor_slot_pair.second;
+
+      if (slot == -1 || !smoother_graph->exists(slot)) {
+        continue;  // Already deleted or not in graph
+      }
+
+      // CRITICAL: Verify the factor at this slot is still the SmartFactor we expect
+      // Slot numbers can be reused - a GP/omega prior might now occupy this slot
+      auto factor_at_slot = smoother_graph->at(slot);
+      if (!factor_at_slot || factor_at_slot.get() != factor.get()) {
+        // Different factor at this slot now (slot was reused) - mark for cleanup
+        if (landmarks_to_remove) {
+          landmarks_to_remove->push_back(lmk_id);
+        }
+        continue;
+      }
+
+      // Check if this SmartFactor references any marginalized keys
+      bool references_marginalized = false;
+      for (const gtsam::Key& key : factor->keys()) {
+        if (marginalized_keys_.find(key) != marginalized_keys_.end()) {
+          references_marginalized = true;
+          break;
+        }
+      }
+
+      if (references_marginalized) {
+        slots_to_delete.push_back(slot);
+        if (landmarks_to_remove) {
+          landmarks_to_remove->push_back(lmk_id);
+        }
+        appPtr_->getLogger().info(
+            "GraphTimeCentricKimera: Deleting SmartFactor for landmark " +
+            std::to_string(lmk_id) + " (slot " + std::to_string(slot) +
+            ") because it references marginalized keys");
       }
     }
   }
@@ -1197,7 +1275,50 @@ void GraphTimeCentricKimera::finalizeIncrementalUpdate() {
   
   appPtr_->getLogger().info(
       "GraphTimeCentricKimera: finalized incremental update, " +
-      std::to_string(keys_sent_to_smoother_.size()) + " total keys now in smoother.");
+      std::to_string(keys_sent_to_smoother_.size()) + " keys tracked (before marginalization check).");
+  
+  // Clear marginalized keys after they've been processed for factor deletion
+  marginalized_keys_.clear();
+}
+
+void GraphTimeCentricKimera::updateMarginalizedKeys(const std::set<gtsam::Key>& current_smoother_keys) {
+  // Find keys that were sent but are no longer in the smoother (they were marginalized)
+  std::vector<gtsam::Key> newly_marginalized_keys;
+  
+  for (const auto& key : keys_sent_to_smoother_) {
+    if (current_smoother_keys.find(key) == current_smoother_keys.end()) {
+      newly_marginalized_keys.push_back(key);
+      marginalized_keys_.insert(key);
+    }
+  }
+  
+  // Remove marginalized keys from active tracking
+  for (const auto& key : newly_marginalized_keys) {
+    keys_sent_to_smoother_.erase(key);
+    
+    // CRITICAL FIX: Clean up keyTimestampMap_ and values_ to prevent unbounded growth.
+    // When keys are marginalized, they should be removed from our tracking structures
+    // to ensure consistent state and prevent memory growth.
+    keyTimestampMap_.erase(key);
+    
+    // Also clean up values_ to prevent unbounded growth
+    if (values_.exists(key)) {
+      values_.erase(key);
+    }
+  }
+  
+  if (!newly_marginalized_keys.empty()) {
+    std::stringstream marg_ss;
+    for (const auto& key : newly_marginalized_keys) {
+      marg_ss << gtsam::DefaultKeyFormatter(key) << " ";
+    }
+    appPtr_->getLogger().info(
+        "GraphTimeCentricKimera: Removed " + std::to_string(newly_marginalized_keys.size()) +
+        " marginalized keys: " + marg_ss.str() +
+        ". Active keys in smoother: " + std::to_string(keys_sent_to_smoother_.size()) +
+        ", keyTimestampMap_size: " + std::to_string(keyTimestampMap_.size()) +
+        ", values_size: " + std::to_string(values_.size()));
+  }
 }
 
 // ========================================================================

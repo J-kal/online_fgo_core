@@ -722,6 +722,12 @@ void KimeraIntegrationInterface::finalizeIncrementalUpdate() {
   }
 }
 
+void KimeraIntegrationInterface::updateMarginalizedKeys(const std::set<gtsam::Key>& current_smoother_keys) {
+  if (graph_) {
+    graph_->updateMarginalizedKeys(current_smoother_keys);
+  }
+}
+
 void KimeraIntegrationInterface::updateSmartFactorSlots(
     const std::vector<LandmarkId>& lmk_ids,
     const std::vector<Slot>& slots) {

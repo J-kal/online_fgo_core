@@ -498,6 +498,15 @@ public:
      * buildIncrementalUpdate() only include factors/values added afterwards.
      */
     void finalizeIncrementalUpdate();
+    
+    /**
+     * @brief Update keys_sent_to_smoother_ to remove marginalized keys
+     * @param current_smoother_keys Keys currently in the smoother (from smoother->timestamps())
+     * 
+     * This removes keys from keys_sent_to_smoother_ that have been marginalized
+     * by the fixed-lag smoother, keeping the tracking accurate.
+     */
+    void updateMarginalizedKeys(const std::set<gtsam::Key>& current_smoother_keys);
 
     // ========================================================================
     // RESULT RETRIEVAL - Get optimized values and covariances
@@ -753,6 +762,7 @@ protected:
     // Track keys that have been successfully integrated into the smoother to avoid
     // ValuesKeyAlreadyExists exceptions and ensure all required values are sent.
     std::set<gtsam::Key> keys_sent_to_smoother_;
+    std::set<gtsam::Key> marginalized_keys_;  // Keys that have been marginalized
     gtsam::KeySet keys_to_finalize_;
     
     // Smart factors already in the graph
